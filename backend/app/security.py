@@ -54,7 +54,8 @@ def require(user: User, *roles: str) -> None:
 
 def write_guard(request: Request, db: Db) -> None:
     origin = request.headers.get("origin")
-    if origin and origin.rstrip("/") != str(request.base_url).rstrip("/"):
+    public_origin = os.environ.get("CRM_PUBLIC_ORIGIN") or str(request.base_url)
+    if origin and origin.rstrip("/") != public_origin.rstrip("/"):
         raise HTTPException(403, "Cross-origin writes are not allowed")
     if request.headers.get("sec-fetch-site") == "cross-site":
         raise HTTPException(403, "Cross-site writes are not allowed")

@@ -36,6 +36,8 @@ npm run dev -- --port 5173
 
 Open http://localhost:5173. Vite proxies `/api` to port 8001.
 
+For a browser preview or reverse proxy that changes the upstream scheme or host, set `CRM_PUBLIC_ORIGIN` to the exact external origin before starting the backend (for example, `https://crm.example.com`, without a path). Browser sign-in and writes must match this origin. When unset, the origin must match the backend request URL. Cross-site writes remain blocked.
+
 ### Demo accounts
 
 These accounts and passwords are public development fixtures. Use a separate database for production. Demo databases are refused when `CRM_ENV=production`.
@@ -119,6 +121,7 @@ Build the frontend before starting the backend. Use an HTTPS reverse proxy in fr
 | `CRM_ADMIN_PASSWORD` | Initial administrator password, at least 12 characters |
 | `CRM_DATABASE_URL` | SQLAlchemy URL, e.g. `postgresql+psycopg://...` or `sqlite:////persistent/path/crm.db` |
 | `CRM_UPLOAD_DIR` | Persistent attachment directory |
+| `CRM_PUBLIC_ORIGIN` | External browser origin when a reverse proxy changes the upstream scheme or host |
 
 The bootstrap password is used only when no users exist. Database tables are created on first startup. Configure persistent database/upload storage, limit HTTP request sizes at the proxy and back up both. Use one API worker in this release because login throttling is in process. Never use the demo database for production.
 

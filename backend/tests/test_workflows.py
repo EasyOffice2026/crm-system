@@ -497,6 +497,55 @@ def test_cancellation_invalidates_pending_approval(workspace: Workspace) -> None
     )
 
 
+def test_public_origin_supports_proxy_login_and_writes(
+    workspace: Workspace, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    public_origin = "https://crm.example.test"
+    credentials = {"email": "admin@crm.local", "password": "IntegrationTest!2026"}
+    with TestClient(main.app) as client:
+        assert (
+            client.post("/api/auth/login", json=credentials, headers={"origin": public_origin}).status_code
+            == 403
+        )
+        assert (
+            client.post(
+                "/api/auth/login", json=credentials, headers={"origin": "http://testserver"}
+            ).status_code
+            == 200
+        )
+        monkeypatch.setenv("CRM_PUBLIC_ORIGIN", public_origin)
+        assert (
+            client.post("/api/auth/login", json=credentials, headers={"origin": public_origin}).status_code
+            == 200
+        )
+        assert client.get("/api/auth/me").status_code == 200
+        assert (
+            client.post(
+                "/api/customers", json={"name": "Preview customer"}, headers={"origin": public_origin}
+            ).status_code
+            == 201
+        )
+        for origin in ["https://untrusted.example", "http://crm.example.test", "http://testserver"]:
+            assert (
+                client.post(
+                    "/api/customers",
+                    json={"name": "Blocked"},
+                    headers={"origin": origin, "x-forwarded-host": "crm.example.test"},
+                ).status_code
+                == 403
+            )
+        assert (
+            client.post(
+                "/api/customers",
+                json={"name": "Blocked"},
+                headers={"origin": public_origin, "sec-fetch-site": "cross-site"},
+            ).status_code
+            == 403
+        )
+        assert client.post("/api/auth/logout", headers={"origin": public_origin}).status_code == 200
+        assert client.get("/api/auth/me").status_code == 401
+
+
 def test_role_permissions_sessions_and_cross_origin_protection(workspace: Workspace) -> None:
     customer_id = create_customer(workspace)
     assert workspace.sales.post("/api/documents", json=payload(customer_id)).status_code == 403
