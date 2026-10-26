@@ -203,6 +203,11 @@ Opening balances and adjustments cannot be issued in hosted workspaces until bal
 posting for them exists (HTTP 409 with the reason). Existing single-company ledgers are never
 replayed: single mode keeps the manual activation/sync path unchanged.
 
+PostgreSQL hosted test (disposable local server only; it drops `crm_ws_*` databases):
+`CRM_TEST_POSTGRES_URL=postgresql+psycopg://<superuser>:<pw>@localhost/<scratch db> .venv/bin/python -m pytest tests/test_hosted_postgres.py`.
+A non-superuser provisioner needs `CREATEROLE` and `CREATEDB`; it is granted membership in each
+workspace role so it can create that role's database.
+
 Existing single-company databases: run `python -m app.migrate --stamp-existing` once (or just start
 the app, which stamps and applies the additive `0002_accounting_outbox` revision).
 
