@@ -12,6 +12,7 @@ from decimal import Decimal
 from pathlib import Path
 from threading import Lock
 from typing import Annotated
+from uuid import UUID, uuid4
 
 from fastapi import APIRouter, Depends, FastAPI, HTTPException, Query, Request, Response, UploadFile
 from fastapi.encoders import jsonable_encoder
@@ -20,7 +21,9 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import ValidationError
 from sqlalchemy import delete, func, select
 
+from .accounting import ACCOUNT_TYPES, journal_payload, pending_entries
 from .db import Base, SessionLocal, engine
+from .erp import erp_get, erp_post
 from .models import (
     Allocation,
     Approval,
@@ -29,6 +32,8 @@ from .models import (
     Customer,
     Document,
     DocumentRevision,
+    ErpLink,
+    ErpPosting,
     LedgerEntry,
     LoginSession,
     Opportunity,
@@ -45,6 +50,7 @@ from .schemas import (
     CustomerInput,
     DecisionInput,
     DocumentInput,
+    ErpActivationInput,
     ItemInput,
     LoginInput,
     OpportunityInput,
@@ -210,6 +216,157 @@ def logout(request: Request, response: Response, db: Db, user: Actor) -> dict[st
 @api.get("/settings")
 def get_settings(db: Db, user: Actor) -> dict[str, object]:
     return settings_data(settings(db))
+
+
+@api.get("/accounting/connection")
+def accounting_connection(db: Db, user: Actor) -> dict[str, object]:
+    require(user, "admin", "manager", "finance")
+    result = erp_get("connection")
+    if not isinstance(result, dict):
+        raise HTTPException(502, "ERP returned an invalid connection")
+    link = db.get(ErpLink, 1)
+    if link and (result.get("tenantId"), result.get("companyId")) != (link.tenant_id, link.company_id):
+        raise HTTPException(409, "ERP credentials point to a different organization or company")
+    config = settings(db)
+    if (result.get("currency"), config.currency, config.decimals) != ("KWD", "KWD", 3):
+        raise HTTPException(409, "CRM and ERP company currencies do not match")
+    return result
+
+
+@api.get("/accounting/accounts")
+def accounting_accounts(db: Db, user: Actor) -> object:
+    accounting_connection(db, user)
+    return erp_get("accounts")
+
+
+@api.get("/accounting/trial-balance")
+def accounting_trial_balance(db: Db, user: Actor, start: date, end: date) -> object:
+    if start > end:
+        raise HTTPException(400, "Start date must precede end date")
+    accounting_connection(db, user)
+    return erp_get("trial-balance", {"from": str(start), "to": str(end)})
+
+
+@api.get("/accounting/journals")
+def accounting_journals(db: Db, user: Actor) -> object:
+    accounting_connection(db, user)
+    return erp_get("journals")
+
+
+@api.get("/accounting/sync-status")
+def accounting_sync_status(db: Db, user: Actor) -> dict[str, object]:
+    require(user, "admin", "manager", "finance")
+    link = db.get(ErpLink, 1)
+    cutoff = link.cutoff_ledger_id if link else db.scalar(select(func.max(LedgerEntry.id))) or 0
+    pending = (
+        db.scalar(
+            select(func.count(LedgerEntry.id))
+            .outerjoin(ErpPosting, ErpPosting.ledger_id == LedgerEntry.id)
+            .where(LedgerEntry.id > cutoff, ErpPosting.ledger_id.is_(None))
+        )
+        or 0
+    )
+    return {
+        "active": link is not None,
+        "enabled": os.environ.get("CRM_ERP_SYNC_ENABLED") == "true",
+        "cutoff_ledger_id": cutoff,
+        "historical_count": db.scalar(select(func.count(LedgerEntry.id)).where(LedgerEntry.id <= cutoff))
+        or 0,
+        "customer_balance": money(
+            db.scalar(select(func.coalesce(func.sum(LedgerEntry.debit - LedgerEntry.credit), 0))) or 0,
+            settings(db).decimals,
+        ),
+        "pending": pending,
+        "postings": [
+            {
+                "ledger_id": posting.ledger_id,
+                "journal_id": posting.journal_id,
+                "number": posting.journal_number,
+            }
+            for posting in db.scalars(select(ErpPosting).order_by(ErpPosting.ledger_id.desc()).limit(50))
+        ],
+    }
+
+
+@mutations.post("/accounting/activate")
+def activate_accounting(body: ErpActivationInput, db: Db, user: Actor) -> dict[str, object]:
+    require(user, "admin")
+    connection = accounting_connection(db, user)
+    if (connection.get("tenantId"), connection.get("companyId")) != (body.tenant_id, body.company_id):
+        raise HTTPException(409, "Confirm the organization and company shown by the connection")
+    if db.get(ErpLink, 1):
+        raise HTTPException(409, "This workspace already has a fixed ERP company mapping")
+    cutoff = db.scalar(select(func.max(LedgerEntry.id))) or 0
+    if body.cutoff_ledger_id != cutoff:
+        raise HTTPException(409, "New transactions were recorded; review reconciliation again")
+    available = erp_get("accounts")
+    if not isinstance(available, list):
+        raise HTTPException(502, "ERP returned invalid accounts")
+    accounts = {row["id"]: row for row in available if isinstance(row, dict) and "id" in row}
+    account_ids = {str(key): value for key, value in body.account_ids.items()}
+    for key, types in ACCOUNT_TYPES.items():
+        identifier = account_ids.get(key)
+        if key == "tax" and not identifier:
+            continue
+        account = accounts.get(identifier)
+        if (
+            not account
+            or account.get("type") not in types
+            or not account.get("isPostable")
+            or not account.get("isActive")
+        ):
+            raise HTTPException(400, f"Choose an active postable {key} account of the correct type")
+    if body.account_ids["receivable"] == body.account_ids["receipts"]:
+        raise HTTPException(400, "Receivables and receipt clearing must use different accounts")
+    db.add(
+        ErpLink(
+            id=1,
+            workspace_id=str(uuid4()),
+            tenant_id=body.tenant_id,
+            company_id=body.company_id,
+            cutoff_ledger_id=cutoff,
+            account_ids=body.account_ids,
+        )
+    )
+    audit(db, user, "ERP company linked", detail=f"{body.company_id}; historical ledger cutoff {cutoff}")
+    db.flush()
+    return accounting_sync_status(db, user)
+
+
+@mutations.post("/accounting/sync")
+def sync_accounting(db: Db, user: Actor) -> dict[str, object]:
+    require(user, "admin", "manager", "finance")
+    if os.environ.get("CRM_ERP_SYNC_ENABLED") != "true":
+        raise HTTPException(409, "ERP synchronization is disabled until reconciliation is approved")
+    accounting_connection(db, user)
+    link = db.get(ErpLink, 1)
+    if not link:
+        raise HTTPException(409, "Review reconciliation and map the ERP company first")
+    posted = 0
+    failure = None
+    for entry in pending_entries(db, link):
+        try:
+            payload = journal_payload(db, link, entry)
+            result = erp_post("journals", payload)
+            if not isinstance(result, dict):
+                raise HTTPException(502, "ERP returned an invalid journal link")
+            try:
+                journal_id = str(UUID(str(result["id"])))
+                number = result["number"]
+                if not isinstance(number, int) or isinstance(number, bool) or number <= 0:
+                    raise ValueError
+            except (KeyError, ValueError) as exc:
+                raise HTTPException(502, "ERP returned an invalid journal link") from exc
+            db.add(
+                ErpPosting(ledger_id=entry.id, journal_id=journal_id, journal_number=number, payload=payload)
+            )
+            audit(db, user, "ERP journal linked", entry.customer_id, f"Ledger {entry.id} → Journal {number}")
+            db.flush()
+            posted += 1
+        except HTTPException as exc:
+            failure = f"Ledger {entry.id}: {exc.detail}"
+            break
+    return {"posted": posted, "failure": failure, **accounting_sync_status(db, user)}
 
 
 @mutations.put("/settings")

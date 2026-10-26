@@ -65,6 +65,46 @@ Seeding is optional. It does not overwrite a workspace with existing customers o
 
 ## Financial workflow
 
+### Accounting inside CRM: one company, one ERP organization
+
+The **Accounting** page uses the CRM login and navigation; it reads the linked Nexera ERP
+company's chart of accounts, journals and trial balance. Admins, managers and finance users can
+access it; sales users cannot. CRM remains a separate application and database, and keeps its
+customer subledger. ERP is the general ledger. No shared database or ERP administrator password
+is used.
+
+1. Deploy the companion ERP CRM integration API. As an ERP owner/finance manager, call
+   `POST /api/v1/companies/{companyId}/crm-integration` using your ERP access token. This creates
+   or rotates a credential for **only that legal company in its organization**. Copy the returned
+   one-time token into the CRM server's secret configuration as `CRM_ERP_TOKEN`; set `CRM_ERP_URL`
+   to the trusted ERP HTTPS origin. Credentials never reach the CRM browser. Never commit them.
+2. Both workspaces must already use **KWD with three decimals**. Existing non-KWD records are not
+   converted automatically. HTTP loopback is allowed only in non-production local development.
+3. Review the ERP receivables balance against the CRM customer balance. Reconcile or explicitly
+   match existing financial records before proceeding. Historical transactions are **not imported,
+   overwritten or reposted** by this connector.
+4. In CRM Accounting, an admin selects the receivables, revenue, receipt/refund clearing, sales
+   returns, opening equity and adjustment accounts (and tax payable when applicable), then confirms
+   that the existing records have been reconciled. This saves an immutable company/account mapping
+   and a future-only ledger cutoff. Concurrent new records require reviewing the cutoff again.
+5. Only after reconciliation, set `CRM_ERP_SYNC_ENABLED=true` on CRM and
+   `CRM_INTEGRATION_POSTING_ENABLED=true` on ERP. Both are **off by default**. Finance users can
+   synchronize up to 10 new customer-ledger transactions per click. This is a manual queue, not
+   a background scheduler. Failed entries remain pending; fix the cause and retry.
+
+Issued invoices debit receivables and credit net revenue/tax; receipts debit clearing and credit
+receivables. Credits debit sales returns/tax and credit receivables. Partial credit-note tax is
+allocated proportionally with cumulative half-up rounding. Refunds reverse clearing against
+receivables; opening balances and adjustments use the explicitly selected accounts. Quotes and
+draft documents never post. ERP validates account scope, balance, open periods and reconciled-bank
+locks. Each event has a stable workspace/ledger ID, duplicate-content protection and a saved ERP
+journal ID/number, making retries safe even after a lost response. Successful journal links appear
+inside Accounting. Changing a token to another organization/company is rejected after mapping.
+
+Bank reconciliation and full financial-statement authoring inside CRM are not part of this initial
+connector; they remain ERP capabilities. A production connection needs the actual organization/company
+chosen, credentials provisioned, and historical balances reconciled. Tests use isolated data only.
+
 `Lead → Customer → Quote → Internal approval → Customer acceptance → Invoice → Payment → Ledger / reports`
 
 1. Draft and pending documents do not post to customer accounts.

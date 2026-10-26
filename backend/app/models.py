@@ -189,6 +189,26 @@ class LedgerEntry(Base):
     credit: Mapped[int] = mapped_column(Integer, default=0)
 
 
+class ErpLink(Base):
+    __tablename__ = "crm_erp_link"
+    id: Mapped[int] = mapped_column(primary_key=True, default=1)
+    workspace_id: Mapped[str] = mapped_column(String(36))
+    tenant_id: Mapped[str] = mapped_column(String(36))
+    company_id: Mapped[str] = mapped_column(String(36))
+    cutoff_ledger_id: Mapped[int] = mapped_column(Integer)
+    account_ids: Mapped[dict[str, str]] = mapped_column(JSON)
+    created: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now)
+
+
+class ErpPosting(Base):
+    __tablename__ = "crm_erp_postings"
+    ledger_id: Mapped[int] = mapped_column(ForeignKey("crm_ledger.id"), primary_key=True)
+    journal_id: Mapped[str] = mapped_column(String(36), unique=True)
+    journal_number: Mapped[int] = mapped_column(Integer)
+    payload: Mapped[dict[str, object]] = mapped_column(JSON)
+    created: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now)
+
+
 class Audit(Base):
     __tablename__ = "crm_audit"
     id: Mapped[int] = mapped_column(primary_key=True)

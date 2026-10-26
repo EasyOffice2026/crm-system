@@ -71,6 +71,7 @@ type Page =
   | "Approvals"
   | "Invoices"
   | "Customer accounts"
+  | "Accounting"
   | "Reports"
   | "Catalogue"
   | "Settings";
@@ -94,6 +95,7 @@ const nav: { name: Page; icon: typeof LayoutDashboard; group?: string }[] = [
   { name: "Approvals", icon: ShieldCheck },
   { name: "Invoices", icon: FileCheck2 },
   { name: "Customer accounts", icon: BookOpen },
+  { name: "Accounting", icon: Building2 },
   { name: "Reports", icon: BarChart3 },
   { name: "Catalogue", icon: Package, group: "MANAGEMENT" },
   { name: "Settings", icon: Settings2 },
@@ -107,6 +109,7 @@ const descriptions: Record<Page, string> = {
   Approvals: "Review, decide and keep your team moving.",
   Invoices: "From completed work to collected revenue.",
   "Customer accounts": "A complete picture of every customer balance.",
+  Accounting: "Your organization's general ledger, inside CRM.",
   Reports: "The numbers behind your business decisions.",
   Catalogue: "Your products and services, ready for the next quote.",
   Settings: "Make this workspace work for your business.",
@@ -377,7 +380,10 @@ export default function App() {
         </div>
         <nav>
           {nav
-            .filter((item) => item.name !== "Reports" || canFinance)
+            .filter(
+              (item) =>
+                canFinance || !["Reports", "Accounting"].includes(item.name),
+            )
             .map((item) => (
               <div key={item.name}>
                 {item.group && <div className="nav-group">{item.group}</div>}
@@ -1405,6 +1411,9 @@ export default function App() {
               onError={(message) => setNotice({ message, error: true })}
             />
           )}
+          {page === "Accounting" && canFinance && (
+            <AccountingPage fmt={fmt} canActivate={user.role === "admin"} />
+          )}
           {page === "Catalogue" && (
             <section className="panel">
               <div className="panel-heading">
@@ -2426,6 +2435,342 @@ function CustomerDetail({
         </>
       )}
     </Modal>
+  );
+}
+
+type AccountingData = {
+  connection: {
+    tenantId: string;
+    companyId: string;
+    tenantName: string;
+    companyName: string;
+    currency: string;
+  };
+  accounts: {
+    id: string;
+    code: string;
+    name: { en: string };
+    type: string;
+    isPostable: boolean;
+    isActive: boolean;
+  }[];
+  sync: {
+    active: boolean;
+    enabled: boolean;
+    cutoff_ledger_id: number;
+    historical_count: number;
+    customer_balance: string;
+    pending: number;
+    postings: { ledger_id: number; journal_id: string; number: number }[];
+  };
+  trial: {
+    rows: {
+      accountId: string;
+      code: string;
+      name: { en: string };
+      closingDebit: string;
+      closingCredit: string;
+    }[];
+    totals: { closingDebit: string; closingCredit: string };
+  };
+  journals: {
+    items: {
+      id: string;
+      number: number;
+      date: string;
+      description: string;
+      totalDebit: string;
+    }[];
+  };
+};
+
+function AccountingPage({
+  fmt,
+  canActivate,
+}: {
+  fmt: (value: string | number) => string;
+  canActivate: boolean;
+}) {
+  const [data, setData] = useState<AccountingData | null>(null);
+  const [error, setError] = useState("");
+  const [end, setEnd] = useState(today());
+  const [start, setStart] = useState(`${today().slice(0, 4)}-01-01`);
+  const [version, setVersion] = useState(0);
+  const [busy, setBusy] = useState(false);
+  const [message, setMessage] = useState("");
+  useEffect(() => {
+    let live = true;
+    setError("");
+    setData(null);
+    api<AccountingData["connection"]>("/accounting/connection")
+      .then(async (connection) => {
+        const [accounts, trial, journals, sync] = await Promise.all([
+          api<AccountingData["accounts"]>("/accounting/accounts"),
+          api<AccountingData["trial"]>(
+            `/accounting/trial-balance?start=${start}&end=${end}`,
+          ),
+          api<AccountingData["journals"]>("/accounting/journals"),
+          api<AccountingData["sync"]>("/accounting/sync-status"),
+        ]);
+        if (live) setData({ connection, accounts, trial, journals, sync });
+      })
+      .catch((reason) => {
+        if (live) setError(errorMessage(reason));
+      });
+    return () => {
+      live = false;
+    };
+  }, [start, end, version]);
+  const mappings = [
+    { key: "receivable", label: "Customer receivables", types: ["ASSET"] },
+    { key: "revenue", label: "Invoice revenue", types: ["REVENUE"] },
+    { key: "receipts", label: "Receipt / refund clearing", types: ["ASSET"] },
+    { key: "returns", label: "Sales returns", types: ["REVENUE"] },
+    { key: "opening", label: "Opening balance equity", types: ["EQUITY"] },
+    {
+      key: "adjustments",
+      label: "Customer adjustments",
+      types: ["EQUITY", "REVENUE", "EXPENSE"],
+    },
+    {
+      key: "tax",
+      label: "Tax payable (optional for untaxed businesses)",
+      types: ["LIABILITY"],
+    },
+  ];
+  return (
+    <>
+      <div className="report-toolbar">
+        <Field label="From">
+          <input
+            type="date"
+            value={start}
+            onChange={(event) => setStart(event.target.value)}
+          />
+        </Field>
+        <Field label="To">
+          <input
+            type="date"
+            value={end}
+            onChange={(event) => setEnd(event.target.value)}
+          />
+        </Field>
+        <button
+          className="button secondary"
+          onClick={() => setVersion((value) => value + 1)}
+        >
+          Refresh accounting
+        </button>
+      </div>
+      {message && (
+        <div className="info-strip" role="status">
+          {message}
+        </div>
+      )}
+      {error && (
+        <div className="panel report-error" role="alert">
+          {error}
+        </div>
+      )}
+      {!error && !data && <div className="panel">Loading accounting data…</div>}
+      {data && (
+        <>
+          <section className="panel">
+            <div className="panel-heading">
+              <h2>{data.connection.companyName}</h2>
+              <Badge tone="green">
+                Connected to {data.connection.tenantName}
+              </Badge>
+            </div>
+            <p>
+              General ledger from Nexera ERP · {data.connection.currency}.
+              Customer accounts remain in CRM.
+            </p>
+          </section>
+          <section className="panel space-top">
+            <div className="panel-heading">
+              <h2>Company reconciliation & synchronization</h2>
+              <Badge>
+                {data.sync.active
+                  ? `${data.sync.pending} pending`
+                  : "Not activated"}
+              </Badge>
+            </div>
+            <p>
+              CRM customer balance: {fmt(data.sync.customer_balance)}.{" "}
+              {data.sync.historical_count} existing transactions are excluded
+              from automatic posting and must be reconciled with ERP first.
+            </p>
+            {!data.sync.active && canActivate && (
+              <form
+                className="form-grid"
+                onSubmit={(event) => {
+                  event.preventDefault();
+                  const form = new FormData(event.currentTarget);
+                  const account_ids = Object.fromEntries(
+                    mappings
+                      .filter((mapping) => form.get(mapping.key))
+                      .map((mapping) => [
+                        mapping.key,
+                        String(form.get(mapping.key)),
+                      ]),
+                  );
+                  setBusy(true);
+                  void api("/accounting/activate", "POST", {
+                    tenant_id: data.connection.tenantId,
+                    company_id: data.connection.companyId,
+                    cutoff_ledger_id: data.sync.cutoff_ledger_id,
+                    reconciled: true,
+                    account_ids,
+                  })
+                    .then(() => {
+                      setMessage(
+                        "Company mapping saved. Only new transactions after this cutoff are eligible for posting.",
+                      );
+                      setVersion((value) => value + 1);
+                    })
+                    .catch((reason) => setMessage(errorMessage(reason)))
+                    .finally(() => setBusy(false));
+                }}
+              >
+                {mappings.map((mapping) => (
+                  <Field key={mapping.key} label={mapping.label}>
+                    <select
+                      name={mapping.key}
+                      required={mapping.key !== "tax"}
+                      defaultValue=""
+                    >
+                      <option value="">Select an account</option>
+                      {data.accounts
+                        .filter(
+                          (account) =>
+                            account.isActive &&
+                            account.isPostable &&
+                            mapping.types.includes(account.type),
+                        )
+                        .map((account) => (
+                          <option key={account.id} value={account.id}>
+                            {account.code} · {account.name.en}
+                          </option>
+                        ))}
+                    </select>
+                  </Field>
+                ))}
+                <label>
+                  <input type="checkbox" required /> I have reconciled existing
+                  customer balances in ERP and approve this future-only cutoff.
+                  These account mappings cannot be changed after activation.
+                </label>
+                <button className="button" disabled={busy}>
+                  Confirm company mapping
+                </button>
+              </form>
+            )}
+            {data.sync.active && (
+              <button
+                className="button secondary"
+                disabled={busy || !data.sync.enabled || !data.sync.pending}
+                onClick={() => {
+                  setBusy(true);
+                  void api<{ posted: number; failure: string | null }>(
+                    "/accounting/sync",
+                    "POST",
+                    {},
+                  )
+                    .then((result) => {
+                      setMessage(
+                        `${result.posted} journals linked.${result.failure ? ` ${result.failure}` : ""}`,
+                      );
+                      setVersion((value) => value + 1);
+                    })
+                    .catch((reason) => setMessage(errorMessage(reason)))
+                    .finally(() => setBusy(false));
+                }}
+              >
+                Synchronize up to 10 transactions
+              </button>
+            )}
+            {!data.sync.enabled && (
+              <p>
+                Posting is disabled until an administrator enables
+                synchronization after reconciliation. Reading accounting data
+                does not post transactions.
+              </p>
+            )}
+            {data.sync.postings.length > 0 && (
+              <Table
+                headers={["CRM ledger entry", "ERP journal", "Journal ID"]}
+              >
+                {data.sync.postings.map((posting) => (
+                  <tr key={posting.ledger_id}>
+                    <td>{posting.ledger_id}</td>
+                    <td>{posting.number}</td>
+                    <td>{posting.journal_id}</td>
+                  </tr>
+                ))}
+              </Table>
+            )}
+          </section>
+          <section className="panel space-top">
+            <div className="panel-heading">
+              <h2>Trial balance</h2>
+            </div>
+            <Table headers={["Account", "Debit", "Credit"]}>
+              {data.trial.rows.map((row) => (
+                <tr key={row.accountId}>
+                  <td>
+                    {row.code} · {row.name.en}
+                  </td>
+                  <td className="amount">{fmt(row.closingDebit)}</td>
+                  <td className="amount">{fmt(row.closingCredit)}</td>
+                </tr>
+              ))}
+              <tr>
+                <td>
+                  <strong>Total</strong>
+                </td>
+                <td className="amount">
+                  <strong>{fmt(data.trial.totals.closingDebit)}</strong>
+                </td>
+                <td className="amount">
+                  <strong>{fmt(data.trial.totals.closingCredit)}</strong>
+                </td>
+              </tr>
+            </Table>
+          </section>
+          <section className="panel space-top">
+            <div className="panel-heading">
+              <h2>Chart of accounts</h2>
+              <Badge>{data.accounts.length} accounts</Badge>
+            </div>
+            <Table headers={["Code", "Account", "Type"]}>
+              {data.accounts.map((account) => (
+                <tr key={account.id}>
+                  <td>{account.code}</td>
+                  <td>{account.name.en}</td>
+                  <td>{account.type}</td>
+                </tr>
+              ))}
+            </Table>
+          </section>
+          <section className="panel space-top">
+            <div className="panel-heading">
+              <h2>Recent journals</h2>
+            </div>
+            <Table headers={["Number", "Date", "Description", "Amount"]}>
+              {data.journals.items.map((journal) => (
+                <tr key={journal.id}>
+                  <td>{journal.number}</td>
+                  <td>{displayDate(journal.date)}</td>
+                  <td>{journal.description}</td>
+                  <td className="amount">{fmt(journal.totalDebit)}</td>
+                </tr>
+              ))}
+            </Table>
+          </section>
+        </>
+      )}
+    </>
   );
 }
 

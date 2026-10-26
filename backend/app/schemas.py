@@ -99,6 +99,16 @@ class ActionInput(Input):
     action: Literal["submit", "send", "accept", "decline", "convert", "cancel"]
 
 
+class ErpActivationInput(Input):
+    tenant_id: str = Field(min_length=36, max_length=36)
+    company_id: str = Field(min_length=36, max_length=36)
+    reconciled: Literal[True]
+    cutoff_ledger_id: int = Field(ge=0)
+    account_ids: dict[
+        Literal["receivable", "revenue", "receipts", "returns", "opening", "adjustments", "tax"], str
+    ] = Field(max_length=7)
+
+
 class DecisionInput(Input):
     decision: Literal["approved", "rejected"]
     comment: str = Field(default="", max_length=2000)
