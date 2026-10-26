@@ -45,6 +45,7 @@ import {
 } from "./forms";
 import { Badge, Empty, Field, Modal, Stat } from "./ui";
 import type {
+  AccountingInfo,
   Activity,
   Approval,
   Customer,
@@ -209,7 +210,10 @@ export default function App() {
       member.role !== "sales"
         ? api<Payment[]>("/payments")
         : Promise.resolve([] as Payment[]),
-      api<Settings>("/settings"),
+      Promise.all([
+        api<Settings>("/settings"),
+        api<Pick<Settings, "hosted" | "manual_ledger_kinds">>("/workspace"),
+      ]).then(([values, mode]) => ({ ...values, ...mode })),
       api<Dashboard>("/dashboard"),
     ]);
     setStore({
@@ -1246,22 +1250,30 @@ export default function App() {
                     >
                       Credit note
                     </button>
-                    <button
-                      className="button secondary"
-                      onClick={() =>
-                        setDialog({ type: "document", kind: "opening" })
-                      }
-                    >
-                      Opening balance
-                    </button>
-                    <button
-                      className="button secondary"
-                      onClick={() =>
-                        setDialog({ type: "document", kind: "adjustment" })
-                      }
-                    >
-                      Adjustment
-                    </button>
+                    {!store.settings.manual_ledger_kinds?.includes(
+                      "opening",
+                    ) && (
+                      <button
+                        className="button secondary"
+                        onClick={() =>
+                          setDialog({ type: "document", kind: "opening" })
+                        }
+                      >
+                        Opening balance
+                      </button>
+                    )}
+                    {!store.settings.manual_ledger_kinds?.includes(
+                      "adjustment",
+                    ) && (
+                      <button
+                        className="button secondary"
+                        onClick={() =>
+                          setDialog({ type: "document", kind: "adjustment" })
+                        }
+                      >
+                        Adjustment
+                      </button>
+                    )}
                     <button
                       className="button secondary"
                       onClick={() =>
@@ -1358,6 +1370,7 @@ export default function App() {
                           <tr key={value.id}>
                             <td>
                               <strong>{value.reference}</strong>
+                              <AccountingBadge info={value.accounting} />
                             </td>
                             <td>{clientName(value.customer_id)}</td>
                             <td>{displayDate(value.date)}</td>
@@ -1389,7 +1402,11 @@ export default function App() {
               <section className="panel space-top">
                 <div className="panel-heading">
                   <h2>Account transactions</h2>
-                  <p>Credit notes, opening balances, adjustments and refunds</p>
+                  <p>
+                    {store.settings.manual_ledger_kinds?.length
+                      ? "Credit notes and refunds. Opening balances and adjustments are recorded by your accountant in the ERP."
+                      : "Credit notes, opening balances, adjustments and refunds"}
+                  </p>
                 </div>
                 <DocumentTable
                   values={store.documents.filter(
@@ -1412,7 +1429,11 @@ export default function App() {
             />
           )}
           {page === "Accounting" && canFinance && (
-            <AccountingPage fmt={fmt} canActivate={user.role === "admin"} />
+            <AccountingPage
+              fmt={fmt}
+              canActivate={user.role === "admin"}
+              canRetry={["admin", "finance"].includes(user.role)}
+            />
           )}
           {page === "Catalogue" && (
             <section className="panel">
@@ -1815,12 +1836,28 @@ function RevisionHistory({
 function Login({ onLogin }: { onLogin: (user: User) => Promise<void> }) {
   const [error, setError] = useState("");
   const [busy, setBusy] = useState(false);
+  const [invite, setInvite] = useState(
+    () => new URLSearchParams(window.location.search).get("invite") ?? "",
+  );
+  const [notice, setNotice] = useState("");
   async function submit(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
     const form = new FormData(event.currentTarget);
     setBusy(true);
     setError("");
     try {
+      if (invite) {
+        if (text(form, "password") !== text(form, "confirm"))
+          throw new Error("The passwords do not match.");
+        await api("/auth/accept-invite", "POST", {
+          token: invite,
+          password: text(form, "password"),
+        });
+        window.history.replaceState(null, "", window.location.pathname);
+        setInvite("");
+        setNotice("Password set. Sign in with your email and new password.");
+        return;
+      }
       const user = await api<User>("/auth/login", "POST", {
         email: text(form, "email"),
         password: text(form, "password"),
@@ -1884,26 +1921,51 @@ function Login({ onLogin }: { onLogin: (user: User) => Promise<void> }) {
           <div className="login-icon">
             <Building2 size={24} />
           </div>
-          <h2>Welcome to your workspace</h2>
-          <p>Sign in to pick up where you left off.</p>
-          <Field label="Email address">
-            <input
-              name="email"
-              type="email"
-              required
-              autoComplete="username"
-              placeholder="you@company.com"
-            />
-          </Field>
-          <Field label="Password">
+          <h2>{invite ? "Set your password" : "Welcome to your workspace"}</h2>
+          <p>
+            {invite
+              ? "Choose a password of at least 12 characters to activate your account."
+              : "Sign in to pick up where you left off."}
+          </p>
+          {notice && (
+            <div className="info-strip" role="status">
+              {notice}
+            </div>
+          )}
+          {!invite && (
+            <Field label="Email address">
+              <input
+                name="email"
+                type="email"
+                required
+                autoComplete="username"
+                placeholder="you@company.com"
+              />
+            </Field>
+          )}
+          <Field label={invite ? "New password" : "Password"}>
             <input
               name="password"
               type="password"
               required
-              autoComplete="current-password"
-              placeholder="Enter your password"
+              minLength={invite ? 12 : undefined}
+              autoComplete={invite ? "new-password" : "current-password"}
+              placeholder={
+                invite ? "At least 12 characters" : "Enter your password"
+              }
             />
           </Field>
+          {invite && (
+            <Field label="Confirm password">
+              <input
+                name="confirm"
+                type="password"
+                required
+                minLength={12}
+                autoComplete="new-password"
+              />
+            </Field>
+          )}
           {error && (
             <div className="error" role="alert">
               {error}
@@ -1915,7 +1977,7 @@ function Login({ onLogin }: { onLogin: (user: User) => Promise<void> }) {
             ) : (
               <ArrowRight size={17} />
             )}
-            {busy ? "Signing in…" : "Sign in"}
+            {busy ? "Please wait…" : invite ? "Set password" : "Sign in"}
           </button>
           <div className="login-note">
             <ShieldCheck size={15} />
@@ -1987,6 +2049,7 @@ function DocumentTable({
                 ? value.payment_state
                 : value.status}
             </Badge>
+            <AccountingBadge info={value.accounting} />
           </td>
           <td>
             <button
@@ -2438,6 +2501,219 @@ function CustomerDetail({
   );
 }
 
+const emptySync: AccountingData["sync"] = {
+  active: false,
+  enabled: false,
+  cutoff_ledger_id: 0,
+  historical_count: 0,
+  customer_balance: "0",
+  pending: 0,
+  postings: [],
+};
+
+type HostedStatus = {
+  mode: "hosted" | "single";
+  enabled: boolean;
+  pausedReason: string | null;
+  erp: { companyName: string; currency: string };
+  counts: Record<string, number>;
+  lastPostedAt: string | null;
+};
+
+type OutboxRow = {
+  id: number;
+  type: string;
+  reference: string | null;
+  date: string | null;
+  total: string | null;
+  status: string;
+  attempts: number;
+  nextAttemptAt: string | null;
+  lastErrorCode: string | null;
+  lastErrorMessage: string | null;
+  erpJournalNumber: number | null;
+};
+
+const accountingLabels: Record<string, string> = {
+  pending: "Posting queued",
+  in_progress: "Posting",
+  retrying: "Retrying",
+  blocked: "Posting blocked",
+  held: "Posting paused",
+  conflict: "Needs support",
+  posted: "Posted",
+  skipped: "Manual posting",
+};
+
+function accountingTone(status: string) {
+  if (status === "posted") return "green";
+  if (["blocked", "conflict"].includes(status)) return "red";
+  if (["held", "retrying", "skipped"].includes(status)) return "amber";
+  return "";
+}
+
+function AccountingBadge({ info }: { info?: AccountingInfo | null }) {
+  if (!info) return null;
+  return (
+    <span title={info.lastErrorMessage ?? undefined}>
+      <Badge tone={accountingTone(info.status)}>
+        {info.status === "posted" && info.erpJournalNumber
+          ? `Journal #${info.erpJournalNumber}`
+          : (accountingLabels[info.status] ?? info.status)}
+      </Badge>
+    </span>
+  );
+}
+
+const pauseMessages: Record<string, string> = {
+  ERP_POSTING_DISABLED:
+    "Automatic posting is switched off in the ERP. Entries stay queued and will post once it is enabled.",
+  CREDENTIAL_REJECTED:
+    "The ERP rejected this workspace's connection. Your provider has been notified; entries stay queued.",
+};
+
+function PostingQueue({
+  status,
+  canRetry,
+  fmt,
+}: {
+  status: HostedStatus;
+  canRetry: boolean;
+  fmt: (value: string | number) => string;
+}) {
+  const [rows, setRows] = useState<OutboxRow[]>([]);
+  const [filter, setFilter] = useState("");
+  const [version, setVersion] = useState(0);
+  const [message, setMessage] = useState("");
+  const [current, setCurrent] = useState(status);
+  useEffect(() => {
+    let live = true;
+    Promise.all([
+      api<OutboxRow[]>(
+        `/accounting/outbox?limit=50${filter ? `&status=${filter}` : ""}`,
+      ),
+      api<HostedStatus>("/accounting/status"),
+    ])
+      .then(([values, latest]) => {
+        if (!live) return;
+        setRows(values);
+        setCurrent(latest);
+      })
+      .catch((reason) => {
+        if (live) setMessage(errorMessage(reason));
+      });
+    return () => {
+      live = false;
+    };
+  }, [filter, version]);
+  return (
+    <>
+      {current.pausedReason && (
+        <div className="panel report-error" role="alert">
+          {pauseMessages[current.pausedReason] ??
+            `Automatic posting is paused (${current.pausedReason}).`}
+        </div>
+      )}
+      <section className="panel">
+        <div className="panel-heading">
+          <h2>Posting queue</h2>
+          <Badge tone={current.enabled ? "green" : ""}>
+            {current.enabled
+              ? `Automatic posting to ${current.erp.companyName || "ERP"}`
+              : "Automatic posting not enabled"}
+          </Badge>
+        </div>
+        <p>
+          Issued invoices, credit notes, refunds and recorded payments post to
+          the ERP automatically. Opening balances and adjustments need manual
+          posting by your accountant.
+          {current.lastPostedAt &&
+            ` Last posted ${displayDate(current.lastPostedAt.slice(0, 10))}.`}
+        </p>
+        <div className="report-toolbar">
+          {Object.entries(current.counts).map(([key, count]) => (
+            <Badge key={key}>
+              {key}: {count}
+            </Badge>
+          ))}
+          <Field label="Status">
+            <select
+              value={filter}
+              onChange={(event) => setFilter(event.target.value)}
+            >
+              <option value="">All</option>
+              {Object.keys(accountingLabels).map((key) => (
+                <option key={key} value={key}>
+                  {accountingLabels[key]}
+                </option>
+              ))}
+            </select>
+          </Field>
+          <button
+            className="button secondary"
+            onClick={() => setVersion((value) => value + 1)}
+          >
+            Refresh queue
+          </button>
+        </div>
+        {message && (
+          <div className="info-strip" role="status">
+            {message}
+          </div>
+        )}
+        <Table
+          headers={[
+            "Reference",
+            "Type",
+            "Date",
+            "Amount",
+            "Status",
+            "Detail",
+            "",
+          ]}
+        >
+          {rows.map((row) => (
+            <tr key={row.id}>
+              <td>{row.reference}</td>
+              <td>{row.type}</td>
+              <td>{row.date ? displayDate(row.date) : ""}</td>
+              <td className="amount">{row.total ? fmt(row.total) : ""}</td>
+              <td>
+                <Badge tone={accountingTone(row.status)}>
+                  {accountingLabels[row.status] ?? row.status}
+                </Badge>
+              </td>
+              <td>
+                {row.erpJournalNumber
+                  ? `Journal #${row.erpJournalNumber}`
+                  : (row.lastErrorMessage ?? row.lastErrorCode ?? "")}
+              </td>
+              <td>
+                {canRetry &&
+                  ["blocked", "retrying", "held"].includes(row.status) && (
+                    <button
+                      className="text-button"
+                      onClick={() => {
+                        void api(`/accounting/outbox/${row.id}/retry`, "POST")
+                          .then(() => {
+                            setMessage("Queued for another attempt.");
+                            setVersion((value) => value + 1);
+                          })
+                          .catch((reason) => setMessage(errorMessage(reason)));
+                      }}
+                    >
+                      Retry now
+                    </button>
+                  )}
+              </td>
+            </tr>
+          ))}
+        </Table>
+      </section>
+    </>
+  );
+}
+
 type AccountingData = {
   connection: {
     tenantId: string;
@@ -2487,10 +2763,27 @@ type AccountingData = {
 function AccountingPage({
   fmt,
   canActivate,
+  canRetry,
 }: {
   fmt: (value: string | number) => string;
   canActivate: boolean;
+  canRetry: boolean;
 }) {
+  const [hostedStatus, setHostedStatus] = useState<HostedStatus | null>(null);
+  useEffect(() => {
+    let live = true;
+    api<HostedStatus>("/accounting/status")
+      .then((status) => {
+        if (live) setHostedStatus(status);
+      })
+      .catch(() => {
+        if (live) setHostedStatus(null);
+      });
+    return () => {
+      live = false;
+    };
+  }, []);
+  const hostedMode = hostedStatus?.mode === "hosted";
   const [data, setData] = useState<AccountingData | null>(null);
   const [error, setError] = useState("");
   const [end, setEnd] = useState(today());
@@ -2510,7 +2803,9 @@ function AccountingPage({
             `/accounting/trial-balance?start=${start}&end=${end}`,
           ),
           api<AccountingData["journals"]>("/accounting/journals"),
-          api<AccountingData["sync"]>("/accounting/sync-status"),
+          api<AccountingData["sync"]>("/accounting/sync-status").catch(
+            () => emptySync,
+          ),
         ]);
         if (live) setData({ connection, accounts, trial, journals, sync });
       })
@@ -2540,6 +2835,9 @@ function AccountingPage({
   ];
   return (
     <>
+      {hostedMode && hostedStatus && (
+        <PostingQueue status={hostedStatus} canRetry={canRetry} fmt={fmt} />
+      )}
       <div className="report-toolbar">
         <Field label="From">
           <input
@@ -2587,130 +2885,133 @@ function AccountingPage({
               Customer accounts remain in CRM.
             </p>
           </section>
-          <section className="panel space-top">
-            <div className="panel-heading">
-              <h2>Company reconciliation & synchronization</h2>
-              <Badge>
-                {data.sync.active
-                  ? `${data.sync.pending} pending`
-                  : "Not activated"}
-              </Badge>
-            </div>
-            <p>
-              CRM customer balance: {fmt(data.sync.customer_balance)}.{" "}
-              {data.sync.historical_count} existing transactions are excluded
-              from automatic posting and must be reconciled with ERP first.
-            </p>
-            {!data.sync.active && canActivate && (
-              <form
-                className="form-grid"
-                onSubmit={(event) => {
-                  event.preventDefault();
-                  const form = new FormData(event.currentTarget);
-                  const account_ids = Object.fromEntries(
-                    mappings
-                      .filter((mapping) => form.get(mapping.key))
-                      .map((mapping) => [
-                        mapping.key,
-                        String(form.get(mapping.key)),
-                      ]),
-                  );
-                  setBusy(true);
-                  void api("/accounting/activate", "POST", {
-                    tenant_id: data.connection.tenantId,
-                    company_id: data.connection.companyId,
-                    cutoff_ledger_id: data.sync.cutoff_ledger_id,
-                    reconciled: true,
-                    account_ids,
-                  })
-                    .then(() => {
-                      setMessage(
-                        "Company mapping saved. Only new transactions after this cutoff are eligible for posting.",
-                      );
-                      setVersion((value) => value + 1);
-                    })
-                    .catch((reason) => setMessage(errorMessage(reason)))
-                    .finally(() => setBusy(false));
-                }}
-              >
-                {mappings.map((mapping) => (
-                  <Field key={mapping.key} label={mapping.label}>
-                    <select
-                      name={mapping.key}
-                      required={mapping.key !== "tax"}
-                      defaultValue=""
-                    >
-                      <option value="">Select an account</option>
-                      {data.accounts
-                        .filter(
-                          (account) =>
-                            account.isActive &&
-                            account.isPostable &&
-                            mapping.types.includes(account.type),
-                        )
-                        .map((account) => (
-                          <option key={account.id} value={account.id}>
-                            {account.code} · {account.name.en}
-                          </option>
-                        ))}
-                    </select>
-                  </Field>
-                ))}
-                <label>
-                  <input type="checkbox" required /> I have reconciled existing
-                  customer balances in ERP and approve this future-only cutoff.
-                  These account mappings cannot be changed after activation.
-                </label>
-                <button className="button" disabled={busy}>
-                  Confirm company mapping
-                </button>
-              </form>
-            )}
-            {data.sync.active && (
-              <button
-                className="button secondary"
-                disabled={busy || !data.sync.enabled || !data.sync.pending}
-                onClick={() => {
-                  setBusy(true);
-                  void api<{ posted: number; failure: string | null }>(
-                    "/accounting/sync",
-                    "POST",
-                    {},
-                  )
-                    .then((result) => {
-                      setMessage(
-                        `${result.posted} journals linked.${result.failure ? ` ${result.failure}` : ""}`,
-                      );
-                      setVersion((value) => value + 1);
-                    })
-                    .catch((reason) => setMessage(errorMessage(reason)))
-                    .finally(() => setBusy(false));
-                }}
-              >
-                Synchronize up to 10 transactions
-              </button>
-            )}
-            {!data.sync.enabled && (
+          {!hostedMode && (
+            <section className="panel space-top">
+              <div className="panel-heading">
+                <h2>Company reconciliation & synchronization</h2>
+                <Badge>
+                  {data.sync.active
+                    ? `${data.sync.pending} pending`
+                    : "Not activated"}
+                </Badge>
+              </div>
               <p>
-                Posting is disabled until an administrator enables
-                synchronization after reconciliation. Reading accounting data
-                does not post transactions.
+                CRM customer balance: {fmt(data.sync.customer_balance)}.{" "}
+                {data.sync.historical_count} existing transactions are excluded
+                from automatic posting and must be reconciled with ERP first.
               </p>
-            )}
-            {data.sync.postings.length > 0 && (
-              <Table
-                headers={["CRM ledger entry", "ERP journal", "Journal ID"]}
-              >
-                {data.sync.postings.map((posting) => (
-                  <tr key={posting.ledger_id}>
-                    <td>{posting.ledger_id}</td>
-                    <td>{posting.number}</td>
-                    <td>{posting.journal_id}</td>
-                  </tr>
-                ))}
-              </Table>
-            )}
-          </section>
+              {!data.sync.active && canActivate && (
+                <form
+                  className="form-grid"
+                  onSubmit={(event) => {
+                    event.preventDefault();
+                    const form = new FormData(event.currentTarget);
+                    const account_ids = Object.fromEntries(
+                      mappings
+                        .filter((mapping) => form.get(mapping.key))
+                        .map((mapping) => [
+                          mapping.key,
+                          String(form.get(mapping.key)),
+                        ]),
+                    );
+                    setBusy(true);
+                    void api("/accounting/activate", "POST", {
+                      tenant_id: data.connection.tenantId,
+                      company_id: data.connection.companyId,
+                      cutoff_ledger_id: data.sync.cutoff_ledger_id,
+                      reconciled: true,
+                      account_ids,
+                    })
+                      .then(() => {
+                        setMessage(
+                          "Company mapping saved. Only new transactions after this cutoff are eligible for posting.",
+                        );
+                        setVersion((value) => value + 1);
+                      })
+                      .catch((reason) => setMessage(errorMessage(reason)))
+                      .finally(() => setBusy(false));
+                  }}
+                >
+                  {mappings.map((mapping) => (
+                    <Field key={mapping.key} label={mapping.label}>
+                      <select
+                        name={mapping.key}
+                        required={mapping.key !== "tax"}
+                        defaultValue=""
+                      >
+                        <option value="">Select an account</option>
+                        {data.accounts
+                          .filter(
+                            (account) =>
+                              account.isActive &&
+                              account.isPostable &&
+                              mapping.types.includes(account.type),
+                          )
+                          .map((account) => (
+                            <option key={account.id} value={account.id}>
+                              {account.code} · {account.name.en}
+                            </option>
+                          ))}
+                      </select>
+                    </Field>
+                  ))}
+                  <label>
+                    <input type="checkbox" required /> I have reconciled
+                    existing customer balances in ERP and approve this
+                    future-only cutoff. These account mappings cannot be changed
+                    after activation.
+                  </label>
+                  <button className="button" disabled={busy}>
+                    Confirm company mapping
+                  </button>
+                </form>
+              )}
+              {data.sync.active && (
+                <button
+                  className="button secondary"
+                  disabled={busy || !data.sync.enabled || !data.sync.pending}
+                  onClick={() => {
+                    setBusy(true);
+                    void api<{ posted: number; failure: string | null }>(
+                      "/accounting/sync",
+                      "POST",
+                      {},
+                    )
+                      .then((result) => {
+                        setMessage(
+                          `${result.posted} journals linked.${result.failure ? ` ${result.failure}` : ""}`,
+                        );
+                        setVersion((value) => value + 1);
+                      })
+                      .catch((reason) => setMessage(errorMessage(reason)))
+                      .finally(() => setBusy(false));
+                  }}
+                >
+                  Synchronize up to 10 transactions
+                </button>
+              )}
+              {!data.sync.enabled && (
+                <p>
+                  Posting is disabled until an administrator enables
+                  synchronization after reconciliation. Reading accounting data
+                  does not post transactions.
+                </p>
+              )}
+              {data.sync.postings.length > 0 && (
+                <Table
+                  headers={["CRM ledger entry", "ERP journal", "Journal ID"]}
+                >
+                  {data.sync.postings.map((posting) => (
+                    <tr key={posting.ledger_id}>
+                      <td>{posting.ledger_id}</td>
+                      <td>{posting.number}</td>
+                      <td>{posting.journal_id}</td>
+                    </tr>
+                  ))}
+                </Table>
+              )}
+            </section>
+          )}
           <section className="panel space-top">
             <div className="panel-heading">
               <h2>Trial balance</h2>

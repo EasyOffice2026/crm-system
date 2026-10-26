@@ -2,6 +2,7 @@ import os
 from collections.abc import Generator
 from sqlite3 import Connection
 
+from fastapi import HTTPException, Request
 from sqlalchemy import create_engine, event
 from sqlalchemy.orm import DeclarativeBase, Session, sessionmaker
 
@@ -28,8 +29,20 @@ def sqlite_pragmas(connection: object, record: object) -> None:
 SessionLocal = sessionmaker(bind=engine, expire_on_commit=False)
 
 
-def db_session() -> Generator[Session, None, None]:
-    with SessionLocal() as session:
+def session_factory(request: Request) -> sessionmaker[Session]:
+    from .tenancy import hosted
+
+    if not hosted():
+        return SessionLocal
+    workspace = getattr(request.state, "workspace", None)
+    if workspace is None:
+        raise HTTPException(404, "Workspace not found")
+    factory: sessionmaker[Session] = workspace.sessions
+    return factory
+
+
+def db_session(request: Request) -> Generator[Session, None, None]:
+    with session_factory(request)() as session:
         try:
             yield session
             session.commit()

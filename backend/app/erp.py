@@ -3,12 +3,14 @@ from urllib.parse import urlsplit
 
 import httpx
 from fastapi import HTTPException
+from sqlalchemy import select
+
+from .tenancy import current_workspace, hosted
 
 
-def connection() -> tuple[str, str]:
+def erp_base() -> str:
     base = os.environ.get("CRM_ERP_URL", "").rstrip("/")
-    token = os.environ.get("CRM_ERP_TOKEN", "")
-    if not base or not token:
+    if not base:
         raise HTTPException(503, "ERP accounting is not connected")
     try:
         parsed = urlsplit(base)
@@ -25,7 +27,33 @@ def connection() -> tuple[str, str]:
         or parsed.fragment
     ):
         raise HTTPException(503, "ERP URL must be a trusted HTTPS origin")
-    return base, token
+    return base
+
+
+def workspace_token(workspace_id: str) -> str | None:
+    from .control import WorkspaceCredential, control_sessions
+    from .secretbox import decrypt
+
+    with control_sessions()() as control:
+        credential = control.scalar(
+            select(WorkspaceCredential).where(
+                WorkspaceCredential.workspace_id == workspace_id, WorkspaceCredential.status == "active"
+            )
+        )
+        return decrypt(credential.token_enc) if credential else None
+
+
+def connection() -> tuple[str, dict[str, str]]:
+    if hosted():
+        workspace = current_workspace.get()
+        token = workspace_token(workspace.id) if workspace else None
+        if not workspace or not token:
+            raise HTTPException(503, "ERP accounting is not connected")
+        return erp_base(), {"Authorization": f"Bearer {token}", "X-Crm-Workspace-Id": workspace.id}
+    token = os.environ.get("CRM_ERP_TOKEN", "")
+    if not os.environ.get("CRM_ERP_URL") or not token:
+        raise HTTPException(503, "ERP accounting is not connected")
+    return erp_base(), {"Authorization": f"Bearer {token}"}
 
 
 def erp_get(path: str, params: dict[str, str] | None = None) -> object:
@@ -39,7 +67,7 @@ def erp_post(path: str, payload: dict[str, object]) -> object:
 def erp_request(
     method: str, path: str, params: dict[str, str] | None = None, payload: dict[str, object] | None = None
 ) -> object:
-    base, token = connection()
+    base, headers = connection()
     try:
         with httpx.Client(timeout=10, follow_redirects=False) as client:
             response = client.request(
@@ -47,7 +75,7 @@ def erp_request(
                 f"{base}/api/v1/integrations/crm/{path}",
                 params=params,
                 json=payload,
-                headers={"Authorization": f"Bearer {token}"},
+                headers=headers,
             )
         if response.status_code in {401, 403}:
             raise HTTPException(502, "ERP rejected the CRM connection")

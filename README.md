@@ -165,6 +165,47 @@ Build the frontend before starting the backend. Use an HTTPS reverse proxy in fr
 
 The bootstrap password is used only when no users exist. Database tables are created on first startup. Configure persistent database/upload storage, limit HTTP request sizes at the proxy and back up both. Use one API worker in this release because login throttling is in process. Never use the demo database for production.
 
+## Hosted workspaces (staging foundation, not enabled in production)
+
+`CRM_TENANCY=hosted` runs one isolated CRM database per client company. A control database
+(`CRM_CONTROL_DATABASE_URL`) lists workspaces; each workspace is served only at
+`https://<slug>.<CRM_BASE_DOMAIN>`, resolved from the `Host` header that reaches Uvicorn
+(`X-Forwarded-Host` is ignored). Unknown or suspended workspaces return 404. Session cookies are
+host-only, `Secure`, `HttpOnly`, `SameSite=Strict`, and session tokens carry the workspace id.
+Attachments are stored under `CRM_UPLOAD_DIR/<workspace id>/`. Demo data is refused in hosted mode.
+
+Provider operations (never from a workspace browser):
+
+```bash
+python -m app.migrate --control                    # create/upgrade the control database
+python -m app.provider provision --request-id <uuid> --slug acme --company-name "Acme Trading" \
+  --legal-name "Acme Trading Co. W.L.L." --cr-number 123456 --fy-start 2026-01-01 --admin-email owner@acme.com
+python -m app.provider process-pending             # finish workspaces requested via POST /provider/v1/workspaces
+python -m app.provider rotate-credential acme
+python -m app.provider suspend acme
+python -m app.provider invite acme owner@acme.com  # new one-time admin invite link (72 h)
+python -m app.migrate --all-workspaces             # upgrade every active workspace
+```
+
+Provisioning is idempotent per request id and resumable: it creates the workspace database and role,
+runs migrations, seeds KWD/3-decimal settings, binds an ERP tenant/company, registers an encrypted
+per-workspace ERP credential (only its SHA-256 hash is sent to ERP), verifies the connection, enables
+accounting with ledger cutoff 0 and creates the first admin with an invite link (or
+`CRM_ADMIN_PASSWORD`). The HTTP provider surface only answers on `CRM_PROVIDER_HOST` with
+`Authorization: Bearer <key>` checked against `CRM_PROVIDER_API_KEY_SHA256`; it records the request,
+and `process-pending` performs the privileged steps.
+
+Issued invoices, credit notes, refunds and recorded payments write a frozen KWD event to
+`crm_accounting_outbox` in the same transaction as the ledger row. `python -m app.accounting_worker`
+(`CRM_ACCOUNTING_WORKER_ENABLED=true`, never with `CRM_ENV=production`) posts them to the ERP with the
+event id as idempotency key and shows status on documents, payments and **Accounting > Posting queue**.
+Opening balances and adjustments cannot be issued in hosted workspaces until balanced automatic
+posting for them exists (HTTP 409 with the reason). Existing single-company ledgers are never
+replayed: single mode keeps the manual activation/sync path unchanged.
+
+Existing single-company databases: run `python -m app.migrate --stamp-existing` once (or just start
+the app, which stamps and applies the additive `0002_accounting_outbox` revision).
+
 ## Release boundaries
 
 This is an initial working implementation. Browser-driven testing and hosted deployment are separate delivery steps. The automated financial tests currently run against SQLite; PostgreSQL compatibility is implemented but has not yet been validated against a live PostgreSQL server.

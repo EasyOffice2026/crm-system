@@ -62,7 +62,13 @@ export type DocumentKind =
   | "opening"
   | "adjustment"
   | "refund";
+export interface AccountingInfo {
+  status: string;
+  erpJournalNumber: number | null;
+  lastErrorMessage: string | null;
+}
 export interface SalesDocument {
+  accounting?: AccountingInfo | null;
   id: number;
   number: string;
   kind: DocumentKind;
@@ -102,6 +108,7 @@ export interface Approval {
   document: SalesDocument;
 }
 export interface Payment {
+  accounting?: AccountingInfo | null;
   id: number;
   customer_id: number;
   amount: string;
@@ -123,6 +130,8 @@ export interface Settings {
   approval_threshold: string;
   discount_threshold: string;
   number_prefixes: Record<DocumentKind, string>;
+  hosted?: boolean;
+  manual_ledger_kinds?: string[];
 }
 export interface Activity {
   id: number;

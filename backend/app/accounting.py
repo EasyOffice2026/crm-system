@@ -1,10 +1,9 @@
-from decimal import ROUND_HALF_UP, Decimal
-
 from fastapi import HTTPException
-from sqlalchemy import func, select
+from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from .models import Document, ErpLink, ErpPosting, LedgerEntry
+from .outbox import credit_note_tax, enqueue_for_ledger
 from .services import money
 
 ACCOUNT_TYPES = {
@@ -66,25 +65,7 @@ def journal_payload(db: Session, link: ErpLink, entry: LedgerEntry) -> dict[str,
         invoice = db.get(Document, source.invoice_id)
         if not invoice or invoice.currency != "KWD" or invoice.decimals != 3:
             raise HTTPException(409, "The source invoice does not match the linked company currency")
-        prior_credit = (
-            db.scalar(
-                select(func.coalesce(func.sum(Document.total), 0))
-                .join(LedgerEntry, LedgerEntry.document_id == Document.id)
-                .where(
-                    Document.invoice_id == invoice.id, Document.kind == "credit", LedgerEntry.id < entry.id
-                )
-            )
-            or 0
-        )
-
-        def credited_tax(total: int) -> int:
-            return int(
-                (Decimal(invoice.tax) * Decimal(total) / Decimal(invoice.total)).quantize(
-                    Decimal(1), rounding=ROUND_HALF_UP
-                )
-            )
-
-        tax = credited_tax(prior_credit + source.total) - credited_tax(prior_credit)
+        tax = credit_note_tax(db, source, invoice, entry.id)
         line("returns", source.total - tax, True)
         line("tax", tax, True)
     elif source and source.kind == "refund":
@@ -101,3 +82,6 @@ def journal_payload(db: Session, link: ErpLink, entry: LedgerEntry) -> dict[str,
         "reference": reference[:100],
         "lines": lines,
     }
+
+
+__all__ = ["ACCOUNT_TYPES", "enqueue_for_ledger", "journal_payload", "pending_entries"]

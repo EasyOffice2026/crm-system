@@ -1,6 +1,17 @@
 from datetime import datetime, timezone
 
-from sqlalchemy import JSON, Boolean, DateTime, ForeignKey, Integer, String, Text
+from sqlalchemy import (
+    JSON,
+    Boolean,
+    CheckConstraint,
+    DateTime,
+    ForeignKey,
+    Index,
+    Integer,
+    String,
+    Text,
+    UniqueConstraint,
+)
 from sqlalchemy.orm import Mapped, mapped_column
 
 from .db import Base
@@ -227,3 +238,70 @@ class Attachment(Base):
     storage_key: Mapped[str] = mapped_column(String(80), unique=True)
     size: Mapped[int] = mapped_column(Integer)
     created: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now)
+
+
+class AccountingState(Base):
+    __tablename__ = "crm_accounting_state"
+    id: Mapped[int] = mapped_column(primary_key=True, default=1)
+    binding_id: Mapped[str | None] = mapped_column(String(36))
+    erp_tenant_id: Mapped[str | None] = mapped_column(String(36))
+    erp_company_id: Mapped[str | None] = mapped_column(String(36))
+    erp_company_name: Mapped[str] = mapped_column(String(200), default="")
+    erp_tenant_name: Mapped[str] = mapped_column(String(200), default="")
+    workspace_id: Mapped[str | None] = mapped_column(String(36))
+    enabled: Mapped[bool] = mapped_column(Boolean, default=False)
+    cutoff_ledger_id: Mapped[int] = mapped_column(Integer, default=0)
+    activated_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    paused_reason: Mapped[str | None] = mapped_column(String(60))
+    paused_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+
+OUTBOX_EVENT_TYPES = ("invoice.issued", "payment.received", "credit_note.issued", "refund.paid")
+OUTBOX_STATUSES = ("pending", "in_progress", "posted", "retrying", "blocked", "held", "conflict", "skipped")
+
+
+class AccountingOutbox(Base):
+    __tablename__ = "crm_accounting_outbox"
+    __table_args__ = (
+        UniqueConstraint("source_type", "source_id", "event_type", name="uq_outbox_source_event"),
+        CheckConstraint(
+            "event_type IN ('invoice.issued','payment.received','credit_note.issued','refund.paid',"
+            "'opening.recorded','adjustment.recorded')",
+            name="ck_outbox_event_type",
+        ),
+        CheckConstraint("source_type IN ('document','payment')", name="ck_outbox_source_type"),
+        CheckConstraint(
+            "status IN ('pending','in_progress','posted','retrying','blocked','held','conflict','skipped')",
+            name="ck_outbox_status",
+        ),
+        Index("ix_outbox_status_next_attempt", "status", "next_attempt_at"),
+    )
+    id: Mapped[int] = mapped_column(primary_key=True)
+    event_id: Mapped[str] = mapped_column(String(100), unique=True)
+    event_type: Mapped[str] = mapped_column(String(40))
+    source_type: Mapped[str] = mapped_column(String(20))
+    source_id: Mapped[int] = mapped_column(Integer)
+    ledger_id: Mapped[int] = mapped_column(ForeignKey("crm_ledger.id"), unique=True)
+    payload: Mapped[dict[str, object]] = mapped_column(JSON)
+    payload_hash: Mapped[str] = mapped_column(String(64))
+    status: Mapped[str] = mapped_column(String(20), default="pending")
+    attempts: Mapped[int] = mapped_column(Integer, default=0)
+    next_attempt_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now)
+    lease_owner: Mapped[str | None] = mapped_column(String(120))
+    lease_expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    last_http_status: Mapped[int | None] = mapped_column(Integer)
+    last_error_code: Mapped[str | None] = mapped_column(String(60))
+    last_error_message: Mapped[str | None] = mapped_column(String(500))
+    erp_journal_id: Mapped[str | None] = mapped_column(String(36))
+    erp_journal_number: Mapped[int | None] = mapped_column(Integer)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now, onupdate=now)
+    posted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+
+class Invite(Base):
+    __tablename__ = "crm_invites"
+    token_hash: Mapped[str] = mapped_column(String(64), primary_key=True)
+    user_id: Mapped[int] = mapped_column(ForeignKey("crm_users.id"))
+    expires: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    used_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))

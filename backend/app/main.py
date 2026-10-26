@@ -15,16 +15,21 @@ from typing import Annotated
 from uuid import UUID, uuid4
 
 from fastapi import APIRouter, Depends, FastAPI, HTTPException, Query, Request, Response, UploadFile
+from fastapi.concurrency import run_in_threadpool
 from fastapi.encoders import jsonable_encoder
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import ValidationError
 from sqlalchemy import delete, func, select
 
 from .accounting import ACCOUNT_TYPES, journal_payload, pending_entries
+from .control import control_url
 from .db import Base, SessionLocal, engine
 from .erp import erp_get, erp_post
+from .migrate import prepare_single
 from .models import (
+    AccountingOutbox,
+    AccountingState,
     Allocation,
     Approval,
     Attachment,
@@ -34,6 +39,7 @@ from .models import (
     DocumentRevision,
     ErpLink,
     ErpPosting,
+    Invite,
     LedgerEntry,
     LoginSession,
     Opportunity,
@@ -43,7 +49,9 @@ from .models import (
     Task,
     User,
 )
+from .outbox import accounting_for, enqueue_for_ledger
 from .pdf import make_pdf
+from .provider_api import router as provider_router
 from .schemas import (
     ActionInput,
     AllocationInput,
@@ -51,6 +59,7 @@ from .schemas import (
     DecisionInput,
     DocumentInput,
     ErpActivationInput,
+    InviteAcceptInput,
     ItemInput,
     LoginInput,
     OpportunityInput,
@@ -60,13 +69,27 @@ from .schemas import (
     TaskInput,
     UserInput,
 )
-from .security import PRODUCTION, Actor, Db, password_hash, require, token_hash, verify_password, write_guard
+from .security import (
+    PRODUCTION,
+    Actor,
+    Db,
+    cookie_secure,
+    new_session_token,
+    password_hash,
+    request_workspace_id,
+    require,
+    token_hash,
+    verify_password,
+    write_guard,
+)
 from .services import (
+    HOSTED_MANUAL_KINDS,
     audit,
     customer,
     customer_balance,
     document,
     document_data,
+    ensure_postable_kind,
     invoice_balance,
     make_document,
     minor,
@@ -74,6 +97,15 @@ from .services import (
     post_document,
     settings,
     unallocated_credit,
+)
+from .tenancy import (
+    base_domain,
+    current_workspace,
+    dispose_all,
+    host_name,
+    hosted,
+    provider_host,
+    resolve_host,
 )
 
 UPLOADS = Path(os.environ.get("CRM_UPLOAD_DIR", "./data/uploads"))
@@ -84,6 +116,13 @@ DUMMY_HASH = password_hash(secrets.token_hex(32))
 
 @asynccontextmanager
 async def lifespan(application: FastAPI) -> AsyncIterator[None]:
+    if hosted():
+        base_domain()
+        control_url()
+        yield
+        dispose_all()
+        return
+    prepare_single(engine)
     Base.metadata.create_all(engine)
     with SessionLocal() as db:
         if not db.get(Settings, 1):
@@ -115,12 +154,38 @@ mutations = APIRouter(prefix="/api", dependencies=[Depends(write_guard)])
 
 
 @app.middleware("http")
+async def resolve_workspace(
+    request: Request, call_next: Callable[[Request], Awaitable[Response]]
+) -> Response:
+    if not hosted():
+        return await call_next(request)
+    host = request.headers.get("host", "")
+    path = request.url.path
+    is_provider = bool(provider_host()) and host_name(host) == provider_host()
+    if is_provider or path.startswith("/provider/"):
+        if not is_provider or not path.startswith("/provider/"):
+            return JSONResponse({"detail": "Not found"}, status_code=404)
+        return await call_next(request)
+    if path == "/api/health":
+        return await call_next(request)
+    workspace = await run_in_threadpool(resolve_host, host)
+    if workspace is None:
+        return JSONResponse({"detail": "Workspace not found"}, status_code=404)
+    request.state.workspace = workspace
+    reset = current_workspace.set(workspace)
+    try:
+        return await call_next(request)
+    finally:
+        current_workspace.reset(reset)
+
+
+@app.middleware("http")
 async def security_headers(request: Request, call_next: Callable[[Request], Awaitable[Response]]) -> Response:
     response = await call_next(request)
     response.headers["X-Content-Type-Options"] = "nosniff"
     response.headers["X-Frame-Options"] = "DENY"
     response.headers["Referrer-Policy"] = "same-origin"
-    if request.url.path.startswith("/api"):
+    if request.url.path.startswith(("/api", "/provider")):
         response.headers["Cache-Control"] = "no-store"
     return response
 
@@ -166,7 +231,9 @@ def health() -> dict[str, str]:
 
 @mutations.post("/auth/login")
 def login(body: LoginInput, request: Request, response: Response, db: Db) -> dict[str, object]:
-    key = request.client.host if request.client else "unknown"
+    address = request.client.host if request.client else "unknown"
+    workspace_id = request_workspace_id(request)
+    key = f"{workspace_id}:{body.email.lower()}:{address}" if workspace_id else address
     now = time.monotonic()
     with login_lock:
         attempts = [value for value in failed_logins.get(key, []) if value > now - 300]
@@ -181,7 +248,7 @@ def login(body: LoginInput, request: Request, response: Response, db: Db) -> dic
         raise HTTPException(401, "Incorrect email or password")
     with login_lock:
         failed_logins.pop(key, None)
-    token = secrets.token_urlsafe(40)
+    token = new_session_token(request)
     db.execute(delete(LoginSession).where(LoginSession.expires < datetime.now(timezone.utc)))
     db.add(
         LoginSession(
@@ -191,7 +258,13 @@ def login(body: LoginInput, request: Request, response: Response, db: Db) -> dic
         )
     )
     response.set_cookie(
-        "crm_session", token, httponly=True, secure=PRODUCTION, samesite="strict", max_age=43200
+        "crm_session",
+        token,
+        httponly=True,
+        secure=cookie_secure(),
+        samesite="strict",
+        max_age=43200,
+        path="/",
     )
     audit(db, user, "Signed in")
     return user_data(user)
@@ -209,7 +282,7 @@ def logout(request: Request, response: Response, db: Db, user: Actor) -> dict[st
             LoginSession.token_hash == token_hash(request.cookies.get("crm_session", ""))
         )
     )
-    response.delete_cookie("crm_session")
+    response.delete_cookie("crm_session", path="/", secure=cookie_secure(), httponly=True, samesite="strict")
     return {"ok": True}
 
 
@@ -218,14 +291,25 @@ def get_settings(db: Db, user: Actor) -> dict[str, object]:
     return settings_data(settings(db))
 
 
+@api.get("/workspace")
+def workspace_mode(user: Actor) -> dict[str, object]:
+    return {"hosted": hosted(), "manual_ledger_kinds": sorted(HOSTED_MANUAL_KINDS) if hosted() else []}
+
+
 @api.get("/accounting/connection")
 def accounting_connection(db: Db, user: Actor) -> dict[str, object]:
     require(user, "admin", "manager", "finance")
     result = erp_get("connection")
     if not isinstance(result, dict):
         raise HTTPException(502, "ERP returned an invalid connection")
-    link = db.get(ErpLink, 1)
-    if link and (result.get("tenantId"), result.get("companyId")) != (link.tenant_id, link.company_id):
+    link: ErpLink | AccountingState | None
+    if hosted():
+        link = db.get(AccountingState, 1)
+        expected = (link.erp_tenant_id, link.erp_company_id) if link else None
+    else:
+        link = db.get(ErpLink, 1)
+        expected = (link.tenant_id, link.company_id) if link else None
+    if expected and (result.get("tenantId"), result.get("companyId")) != expected:
         raise HTTPException(409, "ERP credentials point to a different organization or company")
     config = settings(db)
     if (result.get("currency"), config.currency, config.decimals) != ("KWD", "KWD", 3):
@@ -288,7 +372,12 @@ def accounting_sync_status(db: Db, user: Actor) -> dict[str, object]:
     }
 
 
-@mutations.post("/accounting/activate")
+def legacy_activation_only() -> None:
+    if hosted():
+        raise HTTPException(410, "Hosted workspaces are linked to the ERP by the provider")
+
+
+@mutations.post("/accounting/activate", dependencies=[Depends(legacy_activation_only)])
 def activate_accounting(body: ErpActivationInput, db: Db, user: Actor) -> dict[str, object]:
     require(user, "admin")
     connection = accounting_connection(db, user)
@@ -336,6 +425,17 @@ def activate_accounting(body: ErpActivationInput, db: Db, user: Actor) -> dict[s
 @mutations.post("/accounting/sync")
 def sync_accounting(db: Db, user: Actor) -> dict[str, object]:
     require(user, "admin", "manager", "finance")
+    if hosted():
+        rows = list(
+            db.scalars(select(AccountingOutbox).where(AccountingOutbox.status.in_(("retrying", "blocked"))))
+        )
+        for row in rows:
+            row.status = "pending"
+            row.next_attempt_at = datetime.now(timezone.utc)
+        if rows:
+            audit(db, user, "Accounting retry requested", detail=f"{len(rows)} event(s) scheduled")
+        db.flush()
+        return accounting_status(db, user)
     if os.environ.get("CRM_ERP_SYNC_ENABLED") != "true":
         raise HTTPException(409, "ERP synchronization is disabled until reconciliation is approved")
     accounting_connection(db, user)
@@ -367,6 +467,122 @@ def sync_accounting(db: Db, user: Actor) -> dict[str, object]:
             failure = f"Ledger {entry.id}: {exc.detail}"
             break
     return {"posted": posted, "failure": failure, **accounting_sync_status(db, user)}
+
+
+OUTBOX_COUNT_KEYS = {
+    "pending": "pending",
+    "in_progress": "inProgress",
+    "retrying": "retrying",
+    "blocked": "blocked",
+    "held": "held",
+    "conflict": "conflict",
+    "posted": "posted",
+    "skipped": "skipped",
+}
+
+
+@api.get("/accounting/status")
+def accounting_status(db: Db, user: Actor) -> dict[str, object]:
+    require(user, "admin", "manager", "finance")
+    state = db.get(AccountingState, 1)
+    counts = {value: 0 for value in OUTBOX_COUNT_KEYS.values()}
+    for status, count in db.execute(
+        select(AccountingOutbox.status, func.count(AccountingOutbox.id)).group_by(AccountingOutbox.status)
+    ):
+        counts[OUTBOX_COUNT_KEYS[status]] = count
+    last_posted = db.scalar(select(func.max(AccountingOutbox.posted_at)))
+    config = settings(db)
+    return {
+        "mode": "hosted" if hosted() else "single",
+        "enabled": bool(state and state.enabled),
+        "pausedReason": state.paused_reason if state else None,
+        "erp": {
+            "tenantId": state.erp_tenant_id if state else None,
+            "companyId": state.erp_company_id if state else None,
+            "companyName": state.erp_company_name if state else "",
+            "currency": config.currency,
+        },
+        "counts": counts,
+        "lastPostedAt": last_posted.isoformat() if last_posted else None,
+    }
+
+
+def outbox_data(row: AccountingOutbox) -> dict[str, object]:
+    payload = row.payload
+    amounts = payload.get("amounts")
+    return {
+        "id": row.id,
+        "eventId": row.event_id,
+        "type": row.event_type,
+        "sourceType": row.source_type,
+        "sourceId": row.source_id,
+        "reference": payload.get("reference"),
+        "date": payload.get("date"),
+        "total": amounts.get("total") if isinstance(amounts, dict) else None,
+        "status": row.status,
+        "attempts": row.attempts,
+        "nextAttemptAt": row.next_attempt_at.isoformat() if row.next_attempt_at else None,
+        "lastErrorCode": row.last_error_code,
+        "lastErrorMessage": row.last_error_message,
+        "erpJournalNumber": row.erp_journal_number,
+        "postedAt": row.posted_at.isoformat() if row.posted_at else None,
+    }
+
+
+@api.get("/accounting/outbox")
+def accounting_outbox(
+    db: Db,
+    user: Actor,
+    status: str | None = None,
+    limit: Annotated[int, Query(ge=1, le=200)] = 50,
+    before_id: int | None = None,
+) -> list[dict[str, object]]:
+    require(user, "admin", "manager", "finance")
+    query = select(AccountingOutbox).order_by(AccountingOutbox.id.desc()).limit(limit)
+    if status:
+        if status not in OUTBOX_COUNT_KEYS:
+            raise HTTPException(400, "Unknown posting status")
+        query = query.where(AccountingOutbox.status == status)
+    if before_id:
+        query = query.where(AccountingOutbox.id < before_id)
+    return [outbox_data(row) for row in db.scalars(query)]
+
+
+@mutations.post("/accounting/outbox/{identifier}/retry")
+def retry_outbox(identifier: int, db: Db, user: Actor) -> dict[str, object]:
+    require(user, "admin", "finance")
+    row = db.get(AccountingOutbox, identifier)
+    if not row:
+        raise HTTPException(404, "Posting event not found")
+    if row.status not in {"blocked", "retrying", "held"}:
+        raise HTTPException(409, "Only blocked, retrying or held events can be retried")
+    row.status = "pending"
+    row.next_attempt_at = datetime.now(timezone.utc)
+    state = db.get(AccountingState, 1)
+    if state and state.paused_reason:
+        state.paused_at = None
+    ledger = db.get(LedgerEntry, row.ledger_id)
+    audit(db, user, "Accounting retry requested", ledger.customer_id if ledger else None, row.event_id)
+    db.flush()
+    return outbox_data(row)
+
+
+@mutations.post("/auth/accept-invite")
+def accept_invite(body: InviteAcceptInput, db: Db) -> dict[str, bool]:
+    invite = db.get(Invite, token_hash(body.token))
+    expires = invite.expires if invite else None
+    if expires and expires.tzinfo is None:
+        expires = expires.replace(tzinfo=timezone.utc)
+    if not invite or invite.used_at or not expires or expires < datetime.now(timezone.utc):
+        raise HTTPException(400, "This invitation link is invalid or has expired")
+    member = db.get(User, invite.user_id)
+    if not member or not member.active:
+        raise HTTPException(400, "This invitation link is invalid or has expired")
+    member.password_hash = password_hash(body.password)
+    invite.used_at = datetime.now(timezone.utc)
+    db.execute(delete(LoginSession).where(LoginSession.user_id == member.id))
+    db.add(Audit(actor_id=member.id, action="Invitation accepted", detail=member.email))
+    return {"ok": True}
 
 
 @mutations.put("/settings")
@@ -485,7 +701,9 @@ def customer_history(identifier: int, db: Db, user: Actor) -> dict[str, object]:
 
 
 @mutations.post("/customers/{identifier}/attachments", status_code=201)
-def upload_attachment(identifier: int, file: UploadFile, db: Db, user: Actor) -> dict[str, object]:
+def upload_attachment(
+    identifier: int, file: UploadFile, request: Request, db: Db, user: Actor
+) -> dict[str, object]:
     require(user, "admin", "manager", "sales")
     customer(db, identifier)
     content = file.file.read(10 * 1024 * 1024 + 1)
@@ -494,9 +712,10 @@ def upload_attachment(identifier: int, file: UploadFile, db: Db, user: Actor) ->
     name = Path(file.filename or "attachment").name[:250]
     if Path(name).suffix.lower() not in {".pdf", ".png", ".jpg", ".jpeg", ".csv", ".txt", ".docx", ".xlsx"}:
         raise HTTPException(400, "Use PDF, image, CSV, text, Word or Excel files")
-    UPLOADS.mkdir(parents=True, exist_ok=True)
+    root = upload_root(request)
+    root.mkdir(parents=True, exist_ok=True, mode=0o700)
     key = secrets.token_hex(24)
-    (UPLOADS / key).write_bytes(content)
+    upload_path(root, key).write_bytes(content)
     result = Attachment(customer_id=identifier, name=name, storage_key=key, size=len(content))
     db.add(result)
     db.flush()
@@ -505,13 +724,25 @@ def upload_attachment(identifier: int, file: UploadFile, db: Db, user: Actor) ->
 
 
 @api.get("/attachments/{identifier}")
-def download_attachment(identifier: int, db: Db, user: Actor) -> FileResponse:
+def download_attachment(identifier: int, request: Request, db: Db, user: Actor) -> FileResponse:
     result = db.get(Attachment, identifier)
-    if not result or not (UPLOADS / result.storage_key).is_file():
+    path = upload_path(upload_root(request), result.storage_key) if result else None
+    if not result or not path or not path.is_file():
         raise HTTPException(404, "Attachment not found")
-    return FileResponse(
-        UPLOADS / result.storage_key, media_type="application/octet-stream", filename=result.name
-    )
+    return FileResponse(path, media_type="application/octet-stream", filename=result.name)
+
+
+def upload_root(request: Request) -> Path:
+    workspace = getattr(request.state, "workspace", None)
+    return workspace.upload_root if workspace is not None else UPLOADS
+
+
+def upload_path(root: Path, key: str) -> Path:
+    base = root.resolve()
+    path = (base / key).resolve()
+    if path.parent != base:
+        raise HTTPException(404, "Attachment not found")
+    return path
 
 
 def csv_response(rows: list[list[str]], filename: str) -> Response:
@@ -705,6 +936,7 @@ def documents(db: Db, user: Actor) -> list[dict[str, object]]:
 @mutations.post("/documents", status_code=201)
 def create_document(body: DocumentInput, db: Db, user: Actor) -> dict[str, object]:
     require(user, "admin", "manager", "sales" if body.kind == "quote" else "finance")
+    ensure_postable_kind(body.kind)
     return document_data(db, make_document(db, body, user))
 
 
@@ -898,6 +1130,7 @@ def payments(db: Db, user: Actor) -> list[dict[str, object]]:
                     {"invoice_id": entry.invoice_id, "amount": money(entry.amount, precision)}
                     for entry in allocations
                 ],
+                "accounting": accounting_for(db, "payment", value.id),
             }
         )
     return results
@@ -948,16 +1181,17 @@ def record_payment(body: PaymentInput, db: Db, user: Actor) -> dict[str, object]
     db.flush()
     if allocate(db, result, body.allocations) > amount:
         raise HTTPException(400, "Allocations exceed the payment amount")
-    db.add(
-        LedgerEntry(
-            customer_id=body.customer_id,
-            payment_id=result.id,
-            date=result.date,
-            description=f"Payment · {body.reference}",
-            debit=0,
-            credit=amount,
-        )
+    entry = LedgerEntry(
+        customer_id=body.customer_id,
+        payment_id=result.id,
+        date=result.date,
+        description=f"Payment · {body.reference}",
+        debit=0,
+        credit=amount,
     )
+    db.add(entry)
+    db.flush()
+    enqueue_for_ledger(db, entry)
     audit(
         db,
         user,
@@ -1287,6 +1521,7 @@ def audit_history(
     return jsonable_encoder(list(db.scalars(select(Audit).order_by(Audit.id.desc()).limit(limit))))
 
 
+app.include_router(provider_router)
 app.include_router(api)
 app.include_router(mutations)
 frontend = Path(__file__).resolve().parents[2] / "frontend" / "dist"

@@ -7,6 +7,7 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from .db import Base, SessionLocal, engine
+from .migrate import prepare_single
 from .models import (
     Allocation,
     Approval,
@@ -43,8 +44,13 @@ def issue(db: Session, document: Document, reviewer: User) -> None:
 
 
 def seed() -> None:
+    if os.environ.get("CRM_TENANCY", "single") == "hosted":
+        raise SystemExit(
+            "Demo data is only available in single-company mode; hosted workspaces never seed demo data"
+        )
     if os.environ.get("CRM_ENV") == "production":
         raise RuntimeError("Demo data is available only in development")
+    prepare_single(engine)
     Base.metadata.create_all(engine)
     with SessionLocal() as db:
         if db.scalar(select(Customer.id).limit(1)):

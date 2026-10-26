@@ -15,6 +15,11 @@ class LoginInput(Input):
     password: str = Field(min_length=1, max_length=256)
 
 
+class InviteAcceptInput(Input):
+    token: str = Field(min_length=20, max_length=200)
+    password: str = Field(min_length=12, max_length=256)
+
+
 class UserInput(Input):
     name: str = Field(min_length=1, max_length=120)
     email: str = Field(min_length=3, max_length=254)

@@ -1,3 +1,4 @@
+import os
 from datetime import date
 from decimal import ROUND_HALF_UP, Decimal
 
@@ -16,6 +17,7 @@ from .models import (
     Settings,
     User,
 )
+from .outbox import accounting_for, enqueue_for_ledger
 from .schemas import DocumentInput
 
 
@@ -184,7 +186,20 @@ def make_document(db: Session, body: DocumentInput, user: User, existing: Docume
     return result
 
 
+HOSTED_MANUAL_KINDS = {"opening", "adjustment"}
+HOSTED_MANUAL_REASON = (
+    "Opening balances and adjustments cannot be issued in hosted workspaces yet because they are not "
+    "posted to the ERP automatically. Ask your accountant to record them in the ERP."
+)
+
+
+def ensure_postable_kind(kind: str) -> None:
+    if kind in HOSTED_MANUAL_KINDS and os.environ.get("CRM_TENANCY", "single") == "hosted":
+        raise HTTPException(409, HOSTED_MANUAL_REASON)
+
+
 def post_document(db: Session, result: Document, reviewer: User) -> None:
+    ensure_postable_kind(result.kind)
     if result.kind == "quote":
         result.status = "approved"
         return
@@ -229,16 +244,17 @@ def post_document(db: Session, result: Document, reviewer: User) -> None:
         raise HTTPException(409, "Opening balances must be the first customer ledger entry")
     signed = -result.total if result.kind == "credit" else result.total
     result.status = "issued"
-    db.add(
-        LedgerEntry(
-            customer_id=result.customer_id,
-            document_id=result.id,
-            date=result.date,
-            description=f"{result.number} · {result.reason or result.kind.title()}",
-            debit=max(signed, 0),
-            credit=max(-signed, 0),
-        )
+    entry = LedgerEntry(
+        customer_id=result.customer_id,
+        document_id=result.id,
+        date=result.date,
+        description=f"{result.number} · {result.reason or result.kind.title()}",
+        debit=max(signed, 0),
+        credit=max(-signed, 0),
     )
+    db.add(entry)
+    db.flush()
+    enqueue_for_ledger(db, entry)
 
 
 def document_data(db: Session, result: Document) -> dict[str, object]:
@@ -272,4 +288,5 @@ def document_data(db: Session, result: Document) -> dict[str, object]:
         "invoice_id": result.invoice_id,
         "outstanding": money(outstanding, result.decimals),
         "payment_state": payment_state,
+        "accounting": accounting_for(db, "document", result.id),
     }

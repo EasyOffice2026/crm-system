@@ -11,6 +11,7 @@ from sqlalchemy.orm import Session
 
 from .db import db_session
 from .models import LoginSession, Settings, User
+from .tenancy import hosted
 
 Db = Annotated[Session, Depends(db_session, scope="function")]
 PRODUCTION = os.environ.get("CRM_ENV") == "production"
@@ -32,9 +33,29 @@ def token_hash(token: str) -> str:
     return hashlib.sha256(token.encode()).hexdigest()
 
 
-def current_user(db: Db, crm_session: Annotated[str | None, Cookie()] = None) -> User:
+def request_workspace_id(request: Request) -> str | None:
+    workspace = getattr(request.state, "workspace", None)
+    return workspace.id if workspace is not None else None
+
+
+def new_session_token(request: Request) -> str:
+    workspace_id = request_workspace_id(request)
+    token = secrets.token_urlsafe(40)
+    return f"{workspace_id}.{token}" if workspace_id else token
+
+
+def cookie_secure() -> bool:
+    return PRODUCTION or hosted()
+
+
+def current_user(request: Request, db: Db, crm_session: Annotated[str | None, Cookie()] = None) -> User:
     if not crm_session:
         raise HTTPException(401, "Please sign in")
+    if hosted():
+        workspace_id = request_workspace_id(request)
+        prefix, separator, _ = crm_session.partition(".")
+        if not workspace_id or not separator or not hmac.compare_digest(prefix, workspace_id):
+            raise HTTPException(401, "Please sign in")
     session = db.get(LoginSession, token_hash(crm_session))
     if not session or session.expires.replace(tzinfo=timezone.utc) <= datetime.now(timezone.utc):
         raise HTTPException(401, "Your session has expired")
@@ -54,7 +75,13 @@ def require(user: User, *roles: str) -> None:
 
 def write_guard(request: Request, db: Db) -> None:
     origin = request.headers.get("origin")
-    public_origin = os.environ.get("CRM_PUBLIC_ORIGIN") or str(request.base_url)
+    if hosted():
+        workspace = getattr(request.state, "workspace", None)
+        if workspace is None:
+            raise HTTPException(404, "Workspace not found")
+        public_origin = workspace.origin
+    else:
+        public_origin = os.environ.get("CRM_PUBLIC_ORIGIN") or str(request.base_url)
     if origin and origin.rstrip("/") != public_origin.rstrip("/"):
         raise HTTPException(403, "Cross-origin writes are not allowed")
     if request.headers.get("sec-fetch-site") == "cross-site":
