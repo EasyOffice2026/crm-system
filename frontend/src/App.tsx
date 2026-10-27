@@ -1430,6 +1430,7 @@ export default function App() {
           )}
           {page === "Accounting" && canFinance && (
             <AccountingPage
+              hostedMode={store.settings.hosted === true}
               fmt={fmt}
               canActivate={user.role === "admin"}
               canRetry={["admin", "finance"].includes(user.role)}
@@ -2761,10 +2762,12 @@ type AccountingData = {
 };
 
 function AccountingPage({
+  hostedMode,
   fmt,
   canActivate,
   canRetry,
 }: {
+  hostedMode: boolean;
   fmt: (value: string | number) => string;
   canActivate: boolean;
   canRetry: boolean;
@@ -2783,7 +2786,6 @@ function AccountingPage({
       live = false;
     };
   }, []);
-  const hostedMode = hostedStatus?.mode === "hosted";
   const [data, setData] = useState<AccountingData | null>(null);
   const [error, setError] = useState("");
   const [end, setEnd] = useState(today());

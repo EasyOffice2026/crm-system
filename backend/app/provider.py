@@ -13,6 +13,7 @@ from .provisioning import (
     ProvisionError,
     ProvisionRequest,
     reissue_invite,
+    resume_workspace,
     rotate_credential,
     run_steps,
     suspend_workspace,
@@ -45,6 +46,10 @@ def main(argv: list[str] | None = None) -> int:
     rotate.add_argument("workspace")
     suspend = commands.add_parser("suspend", help="Suspend a workspace in CRM and ERP")
     suspend.add_argument("workspace")
+    resume = commands.add_parser(
+        "resume", help="Resume a provisioned suspended workspace after ERP verification"
+    )
+    resume.add_argument("workspace")
     invite = commands.add_parser("invite", help="Issue a new one-time invitation link")
     invite.add_argument("workspace")
     invite.add_argument("email")
@@ -89,6 +94,8 @@ def main(argv: list[str] | None = None) -> int:
             print(json.dumps(rotate_credential(args.workspace, actor, erp), indent=2))
         elif args.command == "suspend":
             print(json.dumps(suspend_workspace(args.workspace, actor, erp), indent=2))
+        elif args.command == "resume":
+            print(json.dumps(resume_workspace(args.workspace, actor, erp), indent=2))
         elif args.command == "invite":
             print(reissue_invite(args.workspace, args.email, actor))
         else:

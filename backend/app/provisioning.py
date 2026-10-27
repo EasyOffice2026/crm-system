@@ -51,6 +51,22 @@ STEPS = (
     "active",
 )
 INVITE_HOURS = 72
+MAX_AUTO_ATTEMPTS = 8
+
+
+def provisioning_due(workspace: Workspace, now: datetime) -> bool:
+    scheduled = workspace.next_provision_attempt_at
+    if scheduled is None:
+        return workspace.status == "provisioning"
+    if scheduled.tzinfo is None:
+        scheduled = scheduled.replace(tzinfo=UTC)
+    return workspace.status in {"provisioning", "failed"} and scheduled <= now
+
+
+def next_provision_attempt(attempts: int) -> datetime | None:
+    if attempts >= MAX_AUTO_ATTEMPTS:
+        return None
+    return datetime.now(UTC) + timedelta(seconds=min(3600, 30 * 2 ** min(attempts - 1, 7)))
 
 
 class ProvisionError(Exception):
@@ -199,6 +215,10 @@ def public_state(workspace: Workspace) -> dict[str, object]:
         "status": workspace.status,
         "step": workspace.provision_step,
         "lastError": workspace.last_error,
+        "attempts": workspace.provision_attempts,
+        "nextAttemptAt": (
+            workspace.next_provision_attempt_at.isoformat() if workspace.next_provision_attempt_at else None
+        ),
         "origin": workspace_origin(workspace.slug) if os.environ.get("CRM_BASE_DOMAIN") else None,
     }
 
@@ -460,6 +480,8 @@ def run_steps(
     erp: ErpPlatform,
     admin_password: str | None = None,
     fail_at: Callable[[str], None] | None = None,
+    *,
+    scheduled: bool = False,
 ) -> dict[str, object]:
     sessions = control_sessions()
     invite: str | None = None
@@ -471,8 +493,12 @@ def run_steps(
             return public_state(workspace)
         if workspace.status == "suspended":
             raise ProvisionError(409, "WORKSPACE_SUSPENDED", "Suspended workspaces cannot be provisioned")
+        if scheduled and not provisioning_due(workspace, datetime.now(UTC)):
+            return public_state(workspace)
         workspace.status = "provisioning"
         workspace.last_error = None
+        workspace.provision_attempts += 1
+        workspace.next_provision_attempt_at = next_provision_attempt(workspace.provision_attempts)
         control.commit()
         target: Workspace = workspace
 
@@ -512,6 +538,7 @@ def run_steps(
             invite = ensure_admin(workspace, admin_password)
             mark("admin")
             workspace.status = "active"
+            workspace.next_provision_attempt_at = None
             provider_audit(control, workspace.id, actor, "workspace.activated", slug=workspace.slug)
             mark("active")
         except Exception as exc:
@@ -519,6 +546,11 @@ def run_steps(
             workspace = control.get(Workspace, workspace_id)
             assert workspace is not None
             workspace.status = "failed"
+            workspace.next_provision_attempt_at = (
+                None
+                if isinstance(exc, ProvisionError) and exc.status < 500
+                else next_provision_attempt(workspace.provision_attempts)
+            )
             workspace.last_error = (
                 f"{exc.code}: {exc.message}" if isinstance(exc, ProvisionError) else f"{type(exc).__name__}"
             )[:500]
@@ -582,7 +614,10 @@ def rotate_credential(reference: str, actor: str, erp: ErpPlatform | None = None
 def suspend_workspace(reference: str, actor: str, erp: ErpPlatform | None = None) -> dict[str, object]:
     erp = erp or ErpPlatform()
     with control_sessions()() as control:
-        workspace = find_workspace(control, reference)
+        workspace_id = find_workspace(control, reference).id
+    with workspace_lock(workspace_id), control_sessions()() as control:
+        workspace = control.get(Workspace, workspace_id)
+        assert workspace is not None
         workspace.status = "suspended"
         provider_audit(control, workspace.id, actor, "workspace.suspended", slug=workspace.slug)
         control.commit()
@@ -591,6 +626,37 @@ def suspend_workspace(reference: str, actor: str, erp: ErpPlatform | None = None
             response = erp.platform("POST", f"/crm-workspaces/{workspace.id}/suspend", {})
             if response.status_code not in {200, 201, 204}:
                 raise erp_failure(response, "suspension")
+        return public_state(workspace)
+
+
+def resume_workspace(reference: str, actor: str, erp: ErpPlatform | None = None) -> dict[str, object]:
+    erp = erp or ErpPlatform()
+    with control_sessions()() as control:
+        workspace_id = find_workspace(control, reference).id
+    with workspace_lock(workspace_id), control_sessions()() as control:
+        workspace = control.get(Workspace, workspace_id)
+        assert workspace is not None
+        if workspace.status == "active":
+            return public_state(workspace)
+        if workspace.status != "suspended" or not workspace.erp_binding_id:
+            raise ProvisionError(
+                409, "WORKSPACE_NOT_READY", "Only provisioned suspended workspaces can resume"
+            )
+        credential = control.scalar(
+            select(WorkspaceCredential).where(
+                WorkspaceCredential.workspace_id == workspace.id, WorkspaceCredential.status == "active"
+            )
+        )
+        if credential is None:
+            raise ProvisionError(409, "CREDENTIAL_REQUIRED", "No active service credential is available")
+        response = erp.platform("POST", f"/crm-workspaces/{workspace.id}/resume", {})
+        if response.status_code not in {200, 201, 204}:
+            raise erp_failure(response, "resume")
+        verify_connection(workspace, decrypt(credential.token_enc), erp)
+        workspace.status = "active"
+        provider_audit(control, workspace.id, actor, "workspace.resumed", slug=workspace.slug)
+        control.commit()
+        dispose_workspace(workspace.id)
         return public_state(workspace)
 
 

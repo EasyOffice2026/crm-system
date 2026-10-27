@@ -9,6 +9,7 @@ from sqlalchemy import (
     Engine,
     ForeignKey,
     Index,
+    Integer,
     String,
     Text,
     create_engine,
@@ -43,6 +44,8 @@ class Workspace(ControlBase):
     request_hash: Mapped[str] = mapped_column(String(64))
     request_body: Mapped[dict[str, object]] = mapped_column(JSON)
     provision_step: Mapped[str] = mapped_column(String(40), default="control_row")
+    provision_attempts: Mapped[int] = mapped_column(Integer, default=0, server_default="0")
+    next_provision_attempt_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     last_error: Mapped[str | None] = mapped_column(Text)
     db_name: Mapped[str] = mapped_column(String(63), unique=True)
     db_role: Mapped[str] = mapped_column(String(63))

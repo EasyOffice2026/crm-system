@@ -180,9 +180,11 @@ Provider operations (never from a workspace browser):
 python -m app.migrate --control                    # create/upgrade the control database
 python -m app.provider provision --request-id <uuid> --slug acme --company-name "Acme Trading" \
   --legal-name "Acme Trading Co. W.L.L." --cr-number 123456 --fy-start 2026-01-01 --admin-email owner@acme.com
-python -m app.provider process-pending             # finish workspaces requested via POST /provider/v1/workspaces
+python -m app.provider_worker                      # continuously finish provider HTTP requests (opt-in below)
+python -m app.provider process-pending             # explicit operator retry, including held failures
 python -m app.provider rotate-credential acme
 python -m app.provider suspend acme
+python -m app.provider resume acme                  # verify ERP binding/credential before reopening CRM
 python -m app.provider invite acme owner@acme.com  # new one-time admin invite link (72 h)
 python -m app.migrate --all-workspaces             # upgrade every active workspace
 ```
@@ -193,7 +195,20 @@ per-workspace ERP credential (only its SHA-256 hash is sent to ERP), verifies th
 accounting with ledger cutoff 0 and creates the first admin with an invite link (or
 `CRM_ADMIN_PASSWORD`). The HTTP provider surface only answers on `CRM_PROVIDER_HOST` with
 `Authorization: Bearer <key>` checked against `CRM_PROVIDER_API_KEY_SHA256`; it records the request,
-and `process-pending` performs the privileged steps.
+and the separate provider worker performs the privileged steps when
+`CRM_PROVIDER_WORKER_ENABLED=true` (default false; refuses `CRM_ENV=production`). Run it under a
+process supervisor, separately from the unprivileged web process and accounting worker. Only the
+provider process gets `CRM_PROVISIONER_DATABASE_URL` and `CRM_ERP_PLATFORM_KEY`. Restrict the provider
+host at ingress; do not expose the provider key to client browsers.
+
+The worker checks every five seconds, handles up to 20 workspaces per cycle, and resumes each
+idempotent step under a per-workspace PostgreSQL advisory lock. Attempts and retry times survive
+restarts in the control database. Transient failures back off from 30 seconds to one hour; conflicts
+and eight failed attempts require explicit operator retry. Status includes `attempts`, `nextAttemptAt`
+and a sanitized failure. SIGTERM/SIGINT finish the current workspace and stop before the next.
+SQLite control databases support only one provider process; use PostgreSQL for multiple workers.
+Neither worker logs credentials or invitation URLs. After worker onboarding, issue/deliver the
+initial admin link securely using `python -m app.provider invite`; email delivery is not implemented.
 
 Issued invoices, credit notes, refunds and recorded payments write a frozen KWD event to
 `crm_accounting_outbox` in the same transaction as the ledger row. `python -m app.accounting_worker`
@@ -203,7 +218,8 @@ Opening balances and adjustments cannot be issued in hosted workspaces until bal
 posting for them exists (HTTP 409 with the reason). Existing single-company ledgers are never
 replayed: single mode keeps the manual activation/sync path unchanged.
 
-PostgreSQL hosted test (disposable local server only; it drops `crm_ws_*` databases):
+PostgreSQL hosted test (disposable loopback server only; creates a random control database,
+limited `CREATEROLE`/`CREATEDB` provisioner and workspace roles/databases, then drops only its own fixtures):
 `CRM_TEST_POSTGRES_URL=postgresql+psycopg://<superuser>:<pw>@localhost/<scratch db> .venv/bin/python -m pytest tests/test_hosted_postgres.py`.
 A non-superuser provisioner needs `CREATEROLE` and `CREATEDB`; it is granted membership in each
 workspace role so it can create that role's database.
@@ -213,6 +229,6 @@ the app, which stamps and applies the additive `0002_accounting_outbox` revision
 
 ## Release boundaries
 
-This is an initial working implementation. Browser-driven testing and hosted deployment are separate delivery steps. The automated financial tests currently run against SQLite; PostgreSQL compatibility is implemented but has not yet been validated against a live PostgreSQL server.
+This is a staging foundation, not a production SaaS launch. Browser-driven testing and hosted deployment are separate delivery steps. Workspace database isolation and concurrent accounting workers have been verified against disposable PostgreSQL, alongside SQLite financial tests and real CRM-to-ERP HTTP verification.
 
-The customer account ledger is a customer subledger, not a full general ledger. Email/WhatsApp sending, customer self-service acceptance, scheduled email reminders, bilingual screens, external accounting integrations, uploaded company logos, schema migrations for later upgrades and automated backup scheduling are not implemented in this release. Sending and acceptance actions record communication that happens outside the CRM. PDF layouts are English-first.
+The customer account ledger is a subledger; Nexera ERP supplies the general ledger through the server-side integration. Hosted accounting is KWD-only. Opening balances/adjustments, subscription billing, production infrastructure/backups, multi-instance distributed rate limiting and full financial-report/bank-reconciliation authoring inside CRM remain launch gaps. Email/WhatsApp sending, customer self-service acceptance, scheduled email reminders, bilingual screens, uploaded company logos and automated backup scheduling are not implemented. Sending and acceptance actions record communication that happens outside CRM. PDF layouts are English-first. Existing ERP PR dependencies must be reviewed and merged explicitly; this release does not authorize merges or production posting.

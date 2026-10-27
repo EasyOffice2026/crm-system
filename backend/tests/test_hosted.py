@@ -5,7 +5,7 @@ import uuid
 from collections.abc import Iterator
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
-from datetime import date, timedelta
+from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 
 import httpx
@@ -14,7 +14,7 @@ from fastapi.testclient import TestClient
 from sqlalchemy import func, inspect, select, text
 from sqlalchemy.orm import Session, sessionmaker
 
-from app import accounting_worker, main, migrate
+from app import accounting_worker, main, migrate, provider_worker, provisioning
 from app.control import Workspace as ControlWorkspace
 from app.control import WorkspaceCredential, control_engine, control_sessions, reset_control
 from app.models import AccountingOutbox, AccountingState, Customer, LedgerEntry
@@ -24,6 +24,8 @@ from app.provisioning import (
     ProvisionError,
     ProvisionRequest,
     provision_workspace,
+    record_request,
+    resume_workspace,
     rotate_credential,
     suspend_workspace,
 )
@@ -741,3 +743,127 @@ def test_secret_rotation_reads_values_from_previous_key(monkeypatch: pytest.Monk
     monkeypatch.delenv("CRM_SECRET_KEY_PREVIOUS")
     with pytest.raises(RuntimeError):
         secretbox.decrypt(stored)
+
+
+def test_provider_worker_activates_without_logging_invites(
+    erp: FakeErp, caplog: pytest.LogCaptureFixture
+) -> None:
+    workspace = record_request(request("queued"), "test")
+    with caplog.at_level("INFO"):
+        assert provider_worker.run_once(ErpPlatform(erp.client())) == {workspace.id: "active"}
+    result = control_workspace("queued")
+    assert result.provision_attempts == 1 and result.next_provision_attempt_at is None
+    assert provider_worker.run_once(ErpPlatform(erp.client())) == {}
+    assert "inviteUrl" not in caplog.text and "nxc_" not in caplog.text and "token=" not in caplog.text
+
+
+def test_provider_worker_backoff_survives_restart(erp: FakeErp, monkeypatch: pytest.MonkeyPatch) -> None:
+    workspace = record_request(request("backoff"), "test")
+    original = provisioning.ensure_database
+
+    def fail(_workspace: ControlWorkspace) -> None:
+        raise ProvisionError(503, "TEMPORARY", "sensitive-message-not-for-logs")
+
+    monkeypatch.setattr(provisioning, "ensure_database", fail)
+    assert provider_worker.run_once(ErpPlatform(erp.client())) == {workspace.id: "failed"}
+    assert control_workspace("backoff").next_provision_attempt_at is not None
+    reset_control()
+    monkeypatch.setattr(provisioning, "ensure_database", original)
+    assert provider_worker.run_once(ErpPlatform(erp.client())) == {}
+    with control_sessions()() as control:
+        row = control.get(ControlWorkspace, workspace.id)
+        assert row
+        row.next_provision_attempt_at = datetime.now(UTC) - timedelta(seconds=1)
+        control.commit()
+    assert provider_worker.run_once(ErpPlatform(erp.client())) == {workspace.id: "active"}
+    assert control_workspace("backoff").provision_attempts == 2
+
+
+@pytest.mark.parametrize("conflict", [False, True])
+def test_provider_worker_holds_conflicts_and_exhausted_attempts(
+    erp: FakeErp, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture, conflict: bool
+) -> None:
+    workspace = record_request(request("held"), "test")
+    with control_sessions()() as control:
+        row = control.get(ControlWorkspace, workspace.id)
+        assert row
+        row.provision_attempts = 0 if conflict else 7
+        control.commit()
+    original = provisioning.ensure_database
+
+    def fail(_workspace: ControlWorkspace) -> None:
+        raise ProvisionError(409 if conflict else 503, "FAILURE", "sensitive-message-not-for-logs")
+
+    monkeypatch.setattr(provisioning, "ensure_database", fail)
+    assert provider_worker.run_once(ErpPlatform(erp.client())) == {workspace.id: "failed"}
+    assert "sensitive-message-not-for-logs" not in caplog.text
+    held = control_workspace("held")
+    assert held.next_provision_attempt_at is None and held.provision_attempts == (1 if conflict else 8)
+    assert provider_worker.run_once(ErpPlatform(erp.client())) == {}
+    monkeypatch.setattr(provisioning, "ensure_database", original)
+    assert provisioning.run_steps(workspace.id, "operator", ErpPlatform(erp.client()))["status"] == "active"
+
+
+def test_provider_workers_serialize_and_stop_before_next_workspace(erp: FakeErp) -> None:
+    record_request(request("concurrent"), "test")
+    with ThreadPoolExecutor(4) as pool:
+        list(pool.map(lambda _: provider_worker.run_once(ErpPlatform(erp.client())), range(4)))
+    assert control_workspace("concurrent").provision_attempts == 1
+    assert len(erp.bindings) == 1 and len(erp.credentials) == 1
+    waiting = record_request(request("waiting"), "test")
+    stopped = threading.Event()
+    stopped.set()
+    assert provider_worker.run_once(ErpPlatform(erp.client()), stopped) == {}
+    assert control_workspace("waiting").id == waiting.id
+    assert control_workspace("waiting").provision_attempts == 0
+
+
+def test_provider_worker_default_and_production_gates(erp: FakeErp, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("CRM_PROVIDER_WORKER_ENABLED", raising=False)
+    assert provider_worker.main(["--once"]) == 0
+    monkeypatch.setenv("CRM_PROVIDER_WORKER_ENABLED", "true")
+    monkeypatch.setenv("CRM_ENV", "production")
+    assert provider_worker.main(["--once"]) == 2
+    assert not erp.calls
+
+
+def test_control_migration_preserves_existing_workspace(erp: FakeErp, tmp_path: Path) -> None:
+    from alembic import command
+    from sqlalchemy import MetaData, Table
+
+    original = record_request(request("preserved"), "test")
+    engine = make_workspace_engine(f"sqlite:///{tmp_path / 'old-control.db'}")
+    config = migrate.config("control")
+    with engine.begin() as connection:
+        config.attributes["connection"] = connection
+        command.upgrade(config, "0001_control")
+        table = Table("crm_workspaces", MetaData(), autoload_with=connection)
+        connection.execute(table.insert().values(**{c.name: getattr(original, c.name) for c in table.c}))
+    migrate.upgrade(engine, "control")
+    with Session(engine) as db:
+        kept = db.get(ControlWorkspace, original.id)
+        assert kept and kept.slug == "preserved" and kept.provision_attempts == 0
+        assert kept.next_provision_attempt_at is None
+    engine.dispose()
+
+
+def test_resume_requires_verified_erp_and_never_reprovisions(
+    erp: FakeErp, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    provision(erp, "resumeclient")
+    assert suspend_workspace("resumeclient", "test", ErpPlatform(erp.client()))["status"] == "suspended"
+    original = provisioning.verify_connection
+
+    def fail(*_args: object) -> dict[str, object]:
+        raise ProvisionError(502, "ERP_CONNECTION_MISMATCH", "Connection mismatch")
+
+    monkeypatch.setattr(provisioning, "verify_connection", fail)
+    with pytest.raises(ProvisionError):
+        resume_workspace("resumeclient", "test", ErpPlatform(erp.client()))
+    assert control_workspace("resumeclient").status == "suspended"
+    assert provider_worker.run_once(ErpPlatform(erp.client())) == {}
+    monkeypatch.setattr(provisioning, "verify_connection", original)
+    for _ in range(2):
+        assert resume_workspace("resumeclient", "test", ErpPlatform(erp.client()))["status"] == "active"
+    assert control_workspace("resumeclient").provision_attempts == 1
+    assert len(erp.bindings) == len(erp.credentials) == 1
