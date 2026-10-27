@@ -6,6 +6,7 @@ Everything runs on loopback with throwaway databases and random names; see docs/
 import hashlib
 import json
 import os
+import re
 import secrets
 import signal
 import socket
@@ -18,7 +19,7 @@ from dataclasses import dataclass, field
 from datetime import date, timedelta
 from pathlib import Path
 from typing import Any
-from urllib.parse import urlsplit, urlunsplit
+from urllib.parse import parse_qs, urlsplit, urlunsplit
 
 import httpx
 import psycopg
@@ -114,6 +115,7 @@ def cleanup(stack: Stack) -> None:
                 process.wait(15)
             except subprocess.TimeoutExpired:
                 process.kill()
+                process.wait(5)
     if KEEP:
         print(
             f"CRM_E2E_KEEP=1: kept databases {stack.erp_db}, {stack.control_db} and crm_ws_* of run {stack.run}"
@@ -123,13 +125,16 @@ def cleanup(stack: Stack) -> None:
     try:
         with psycopg.connect(db_url(stack.control_db)) as connection:
             workspaces = [
-                tuple(row) for row in connection.execute("SELECT db_name, db_role FROM crm_workspaces")
+                tuple(row)
+                for row in connection.execute(
+                    "SELECT db_name, db_role FROM crm_workspaces WHERE slug = ANY(%s)",
+                    (list(stack.slugs.values()),),
+                )
             ]
     except psycopg.Error:
         pass
-    slugs = set(stack.slugs.values())
     for name, role in workspaces:
-        if name.startswith("crm_ws_") and role.startswith("crm_ws_") and any(slug in name for slug in slugs):
+        if re.fullmatch(r"crm_ws_[0-9a-f]{32}", name) and role == name:
             admin_execute(
                 sql.SQL("DROP DATABASE IF EXISTS {} WITH (FORCE)").format(sql.Identifier(name)),
                 sql.SQL("DROP ROLE IF EXISTS {}").format(sql.Identifier(role)),
@@ -145,6 +150,7 @@ def stack(tmp_path: Path) -> Iterator[Stack]:
     erp_port, crm_port = free_port(), free_port()
     key_id = "e2e" + run
     platform_key = f"nxp_{key_id}_{secrets.token_urlsafe(32)}"
+    provider_key = secrets.token_urlsafe(32)
     base_env = {name: os.environ[name] for name in ("PATH", "HOME", "LANG", "TZ") if name in os.environ}
     current = Stack(
         run=run,
@@ -212,6 +218,7 @@ def stack(tmp_path: Path) -> Iterator[Stack]:
             "CRM_BASE_DOMAIN": BASE_DOMAIN,
             "CRM_WORKSPACE_SCHEME": "http",
             "CRM_PROVIDER_HOST": f"provider.{BASE_DOMAIN}",
+            "CRM_PROVIDER_API_KEY_SHA256": hashlib.sha256(provider_key.encode()).hexdigest(),
             "CRM_SECRET_KEY": secrets.token_urlsafe(48),
             "CRM_UPLOAD_DIR": str(tmp_path / "uploads"),
             "CRM_ERP_URL": current.erp_url,
@@ -247,25 +254,37 @@ def stack(tmp_path: Path) -> Iterator[Stack]:
         )
         wait_http(f"{current.crm_url}/api/health", current.processes[-1], crm_log)
         for label, slug in current.slugs.items():
-            provisioned = subprocess.run(
+            response = httpx.post(
+                f"{current.crm_url}/provider/v1/workspaces",
+                headers={"Host": f"provider.{BASE_DOMAIN}", "Authorization": f"Bearer {provider_key}"},
+                json={
+                    "request_id": str(uuid.uuid4()),
+                    "slug": slug,
+                    "company_name": f"{label.title()} Trading {run}",
+                    "legal_name": f"{label.title()} Trading {run} W.L.L.",
+                    "cr_number": str(secrets.randbelow(10**8)).zfill(8),
+                    "fy_start": f"{YEAR}-01-01",
+                    "admin_email": f"owner@{slug}.example",
+                },
+            )
+            assert response.status_code == 202, response.text
+            assert response.json()["status"] == "provisioning"
+        provisioned = subprocess.run(
+            [sys.executable, "-m", "app.provider_worker", "--once"],
+            cwd=BACKEND,
+            env={**current.crm_env, "CRM_PROVIDER_WORKER_ENABLED": "true"},
+            capture_output=True,
+            text=True,
+        )
+        assert provisioned.returncode == 0, provisioned.stdout + provisioned.stderr
+        for slug in current.slugs.values():
+            invited = subprocess.run(
                 [
                     sys.executable,
                     "-m",
                     "app.provider",
-                    "provision",
-                    "--request-id",
-                    str(uuid.uuid4()),
-                    "--slug",
+                    "invite",
                     slug,
-                    "--company-name",
-                    f"{label.title()} Trading {run}",
-                    "--legal-name",
-                    f"{label.title()} Trading {run} W.L.L.",
-                    "--cr-number",
-                    str(secrets.randbelow(10**8)).zfill(8),
-                    "--fy-start",
-                    f"{YEAR}-01-01",
-                    "--admin-email",
                     f"owner@{slug}.example",
                 ],
                 cwd=BACKEND,
@@ -273,7 +292,14 @@ def stack(tmp_path: Path) -> Iterator[Stack]:
                 capture_output=True,
                 text=True,
             )
-            assert provisioned.returncode == 0, provisioned.stdout + provisioned.stderr
+            assert invited.returncode == 0, "Admin invitation delivery failed"
+            token = parse_qs(urlsplit(invited.stdout.strip()).query)["invite"][0]
+            accepted = httpx.post(
+                f"{current.crm_url}/api/auth/accept-invite",
+                headers={"Host": f"{slug}.{BASE_DOMAIN}", "Origin": f"http://{slug}.{BASE_DOMAIN}"},
+                json={"token": token, "password": current.admin_password},
+            )
+            assert accepted.status_code == 200, "Admin invitation acceptance failed"
         yield current
     finally:
         cleanup(current)

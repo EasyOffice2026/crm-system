@@ -39,7 +39,8 @@ any check fails. Expect 62 checks.
 
 ## Coverage
 
-- Onboarding: the CRM provider CLI provisions two clients through the ERP platform API. Each gets its own ERP
+- Onboarding: provider HTTP requests queue two clients, the separate provider worker provisions them through
+  the ERP platform API, and one-time admin invitations are delivered/accepted. Each gets its own ERP
   tenant and company, the `general_business_v1` chart, a posting profile, 12 open periods, no human ERP users,
   and one hash-only service credential.
 - Non-posting activity creates no outbox rows: the quote lifecycle, a draft invoice, a task and a won opportunity.
