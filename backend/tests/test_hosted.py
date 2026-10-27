@@ -581,7 +581,46 @@ def test_retry_requires_finance_or_admin_role(erp: FakeErp) -> None:
         assert sales.get("/api/accounting/outbox").status_code == 403
         row = outbox_rows("roles")[0]
         assert sales.post(f"/api/accounting/outbox/{row.id}/retry").status_code == 403
+    response = client.post(
+        "/api/users",
+        json={"name": "Manager", "email": "manager@roles.example", "password": PASSWORD, "role": "manager"},
+    )
+    assert response.status_code == 201, response.text
+    with browser("roles") as manager:
+        login = {"email": "manager@roles.example", "password": PASSWORD}
+        assert manager.post("/api/auth/login", json=login).status_code == 200
+        assert manager.get("/api/accounting/status").status_code == 200
+        assert manager.post("/api/accounting/sync").status_code == 403
+        assert manager.post(f"/api/accounting/outbox/{row.id}/retry").status_code == 403
+    assert client.post("/api/accounting/sync").status_code == 200
     client.__exit__(None, None, None)
+
+
+def test_login_throttle_survives_a_flood_of_new_keys(erp: FakeErp, monkeypatch: pytest.MonkeyPatch) -> None:
+    seeded(erp, "flood").__exit__(None, None, None)
+    monkeypatch.setattr(main, "LOGIN_THROTTLE_MAX_KEYS", 20)
+    monkeypatch.setattr(main, "LOGIN_ADDRESS_LIMIT", 1000)
+    with browser("flood") as attacker:
+        target = {"email": "owner@flood.example", "password": "wrong-password-123"}
+        for _ in range(10):
+            assert attacker.post("/api/auth/login", json=target).status_code == 401
+        assert attacker.post("/api/auth/login", json=target).status_code == 429
+        for index in range(40):
+            other = {"email": f"random{index}@flood.example", "password": "wrong-password-123"}
+            assert attacker.post("/api/auth/login", json=other).status_code == 401
+        assert attacker.post("/api/auth/login", json=target).status_code == 429
+    assert len(main.failed_logins) <= 20
+
+
+def test_login_throttle_limits_failures_per_address(erp: FakeErp, monkeypatch: pytest.MonkeyPatch) -> None:
+    seeded(erp, "spray").__exit__(None, None, None)
+    monkeypatch.setattr(main, "LOGIN_ADDRESS_LIMIT", 5)
+    with browser("spray") as attacker:
+        for index in range(5):
+            other = {"email": f"random{index}@spray.example", "password": "wrong-password-123"}
+            assert attacker.post("/api/auth/login", json=other).status_code == 401
+        owner = {"email": "owner@spray.example", "password": PASSWORD}
+        assert attacker.post("/api/auth/login", json=owner).status_code == 429
 
 
 @pytest.mark.parametrize(

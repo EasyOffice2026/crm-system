@@ -110,6 +110,24 @@ from .tenancy import (
 
 UPLOADS = Path(os.environ.get("CRM_UPLOAD_DIR", "./data/uploads"))
 failed_logins: dict[str, list[float]] = {}
+LOGIN_THROTTLE_MAX_KEYS = 10000
+LOGIN_ADDRESS_LIMIT = 50
+
+
+def record_login_attempt(key: str, attempts: list[float], now: float) -> None:
+    # When full, drop expired keys, then the least active ones; locked-out keys go last, so a flood
+    # of new keys cannot reset the lockout of an account that is under attack.
+    if key not in failed_logins and len(failed_logins) >= LOGIN_THROTTLE_MAX_KEYS:
+        for stale in [name for name, times in failed_logins.items() if not times or times[-1] <= now - 300]:
+            del failed_logins[stale]
+        excess = len(failed_logins) - LOGIN_THROTTLE_MAX_KEYS + 1
+        if excess > 0:
+            ranked = sorted(failed_logins.items(), key=lambda item: (len(item[1]) >= 10, item[1][-1]))
+            for name, _ in ranked[:excess]:
+                del failed_logins[name]
+    failed_logins[key] = attempts
+
+
 login_lock = Lock()
 DUMMY_HASH = password_hash(secrets.token_hex(32))
 
@@ -234,20 +252,28 @@ def login(body: LoginInput, request: Request, response: Response, db: Db) -> dic
     address = request.client.host if request.client else "unknown"
     workspace_id = request_workspace_id(request)
     key = f"{workspace_id}:{body.email.lower()}:{address}" if workspace_id else address
+    address_key = f"{workspace_id}::{address}" if workspace_id else None
     now = time.monotonic()
     with login_lock:
         attempts = [value for value in failed_logins.get(key, []) if value > now - 300]
-        if len(attempts) >= 10:
+        address_attempts = (
+            [value for value in failed_logins.get(address_key, []) if value > now - 300]
+            if address_key
+            else []
+        )
+        if len(attempts) >= 10 or len(address_attempts) >= LOGIN_ADDRESS_LIMIT:
             raise HTTPException(429, "Too many attempts. Try again in five minutes.")
-        if len(failed_logins) > 10000:
-            failed_logins.clear()
-        failed_logins[key] = attempts + [now]
+        record_login_attempt(key, attempts + [now], now)
+        if address_key:
+            record_login_attempt(address_key, address_attempts + [now], now)
     user = db.scalar(select(User).where(User.email == body.email.lower()))
     valid = verify_password(body.password, user.password_hash if user else DUMMY_HASH)
     if not user or not valid or not user.active:
         raise HTTPException(401, "Incorrect email or password")
     with login_lock:
         failed_logins.pop(key, None)
+        if address_key and now in failed_logins.get(address_key, []):
+            failed_logins[address_key].remove(now)
     token = new_session_token(request)
     db.execute(delete(LoginSession).where(LoginSession.expires < datetime.now(timezone.utc)))
     db.add(
@@ -424,8 +450,8 @@ def activate_accounting(body: ErpActivationInput, db: Db, user: Actor) -> dict[s
 
 @mutations.post("/accounting/sync")
 def sync_accounting(db: Db, user: Actor) -> dict[str, object]:
-    require(user, "admin", "manager", "finance")
     if hosted():
+        require(user, "admin", "finance")
         rows = list(
             db.scalars(select(AccountingOutbox).where(AccountingOutbox.status.in_(("retrying", "blocked"))))
         )
@@ -436,6 +462,7 @@ def sync_accounting(db: Db, user: Actor) -> dict[str, object]:
             audit(db, user, "Accounting retry requested", detail=f"{len(rows)} event(s) scheduled")
         db.flush()
         return accounting_status(db, user)
+    require(user, "admin", "manager", "finance")
     if os.environ.get("CRM_ERP_SYNC_ENABLED") != "true":
         raise HTTPException(409, "ERP synchronization is disabled until reconciliation is approved")
     accounting_connection(db, user)
