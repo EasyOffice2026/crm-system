@@ -88,7 +88,10 @@ def upgrade() -> None:
             sa.UniqueConstraint("source_type", "source_id", "event_type", name="uq_outbox_source_event"),
         )
         op.create_index(
-            "ix_outbox_status_next_attempt", "crm_accounting_outbox", ["status", "next_attempt_at"], unique=False
+            "ix_outbox_status_next_attempt",
+            "crm_accounting_outbox",
+            ["status", "next_attempt_at"],
+            unique=False,
         )
 
 

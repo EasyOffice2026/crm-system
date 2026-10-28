@@ -2,7 +2,11 @@
 
 A standalone CRM for general businesses: customer records, sales opportunities, follow-ups, quotes, approvals, invoices, customer account ledgers and reporting.
 
-This project has its own codebase and database. It does not connect to the management, HRM or accounting applications.
+This project has its own codebase and database, independent of management, HRM and accounting-saas.
+Its optional built-in Accounting module uses Nexera ERP through server-side APIs.
+
+For the persistent hosted demonstration, see [cloud staging deployment](docs/cloud-staging.md).
+This staging setup is not a production SaaS launch.
 
 ## Run locally
 
