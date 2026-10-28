@@ -76,6 +76,8 @@ must be `/data/uploads` on the web machine; run that process as `crm` so directo
 remain accessible to the application. Do not store provider credentials on the image
 or in shell history. Capture its one-time administrator invitation privately, not in
 deployment logs; the user sets their own password using that invitation.
+The image sets `PYTHONPATH=/app/backend` so one-off commands also load the source-tree
+migrations and built frontend, even when the execution API starts in another directory.
 
 Provider HTTP access and continuous provider provisioning are disabled for this demo.
 The accounting worker is enabled only with `CRM_ENV=staging`, operates on the isolated

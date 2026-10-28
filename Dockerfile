@@ -8,6 +8,7 @@ RUN npm run build
 FROM python:3.12-slim-bookworm
 ENV PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONPATH=/app/backend \
     CRM_DATABASE_URL=sqlite:////data/unused-single.db \
     CRM_UPLOAD_DIR=/data/uploads
 WORKDIR /app/backend
